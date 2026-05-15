@@ -6,7 +6,8 @@
 设计目标：
 - 端到端自动化：视频 -> 抽帧 -> COLMAP -> 训练 -> 导出 -> 渲染对比；
 - 轻量化：参考 Compact-3DGS 的“点数控制 / 稀疏优化”思想，优先保证稳定与显存；
-- 小白可运行：默认参数可直接跑，支持 quick/full 两种模式。
+- 小白可运行：默认参数可直接跑，支持 quick/full 两种模式；
+- 训练可每 N 步保存 checkpoint、断点续训（--resume），并在中间存档后可选生成对比渲染图。
 """
 
 from __future__ import annotations
@@ -83,6 +84,41 @@ class GaussianModel(nn.Module):
             "opacity_logits": self.opacity_logits.detach().cpu(),
             "log_scales": self.log_scales.detach().cpu(),
         }
+
+    @classmethod
+    def from_saved_dict(cls, ckpt: Dict, device: torch.device) -> "GaussianModel":
+        """从 torch.save 的 dict 恢复模型（支持含 sh_coeffs 或仅 rgb 的旧 ckpt）。"""
+        if "sh_coeffs" in ckpt and ckpt["sh_coeffs"] is not None:
+            m = cls.__new__(cls)
+            nn.Module.__init__(m)
+            m.xyz = nn.Parameter(ckpt["xyz"].to(device=device, dtype=torch.float32).contiguous())
+            m.sh_coeffs = nn.Parameter(ckpt["sh_coeffs"].to(device=device, dtype=torch.float32).contiguous())
+            m.opacity_logits = nn.Parameter(ckpt["opacity_logits"].to(device=device, dtype=torch.float32).contiguous())
+            m.log_scales = nn.Parameter(ckpt["log_scales"].to(device=device, dtype=torch.float32).contiguous())
+            return m
+        xyz = ckpt["xyz"].to(device=device, dtype=torch.float32)
+        rgb = ckpt["rgb"].to(device=device, dtype=torch.float32)
+        return cls(xyz=xyz, rgb=rgb)
+
+
+def build_training_checkpoint(
+    model: GaussianModel,
+    args: argparse.Namespace,
+    global_step: int,
+    optimizer: optim.Optimizer,
+) -> Dict:
+    """训练用完整 checkpoint（含路径与优化器，便于断点续训）。"""
+    ck: Dict = dict(model.state_for_save())
+    ck["train_h"] = int(args.train_h)
+    ck["train_w"] = int(args.train_w)
+    ck["iters"] = int(args.iters)
+    ck["global_step"] = int(global_step)
+    ck["mode"] = args.mode
+    ck["rasterizer"] = args.rasterizer
+    ck["transforms_path"] = str(Path(args.transforms_path).resolve())
+    ck["points3d_path"] = str(Path(args.points3d_path).resolve())
+    ck["optimizer"] = optimizer.state_dict()
+    return ck
 
 
 def sample_points_from_colmap(
@@ -298,6 +334,7 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
     run_dir = Path(args.run_dir)
     logs_dir = ensure_dir(run_dir / "logs")
     model_dir = ensure_dir(run_dir / "models")
+    render_root = ensure_dir(run_dir / "renders")
     logger = create_logger(logs_dir / "train.log", logger_name="train")
 
     if device.type == "cuda":
@@ -306,12 +343,37 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
     if args.rasterizer == "gsplat" and not raster_gsplat.is_gsplat_available():
         raise RuntimeError("已选择 --rasterizer gsplat 但未安装 gsplat。请 pip install gsplat 后重试，或改用 --rasterizer pytorch。")
 
+    resume_path = (getattr(args, "resume", "") or "").strip()
+    start_iter = 0
+    resume_pack: Dict | None = None
+    if resume_path:
+        rp = Path(resume_path).expanduser().resolve()
+        if not rp.is_file():
+            raise FileNotFoundError(f"--resume 不存在: {rp}")
+        resume_pack = torch.load(rp, map_location=device)
+        if "global_step" in resume_pack:
+            start_iter = int(resume_pack["global_step"])
+        else:
+            logger.warning(
+                "checkpoint 无 global_step，将从 iter=0 继续训练（权重已加载）。"
+                "若只想渲染请勿使用 --resume；旧版 final 可重新跑满 iters 或换用带步数的中间 ckpt。"
+            )
+            start_iter = 0
+        if resume_pack.get("train_h") and resume_pack.get("train_w"):
+            args.train_h = int(resume_pack["train_h"])
+            args.train_w = int(resume_pack["train_w"])
+        if resume_pack.get("rasterizer"):
+            args.rasterizer = str(resume_pack["rasterizer"])
+        logger.info("断点续训: 从 %s 恢复，已完成 iter=%d，目标 iters=%d", rp, start_iter, args.iters)
+
     logger.info("训练设备: %s", device)
     logger.info(gpu_status_text(device) + gpu_peak_status_text(device))
     logger.info(
-        "训练: iters=%d, views_per_step=%d, rasterizer=%s, max_gaussians=%d, min_gaussians=%d, "
+        "训练: iters=%d, start=%d, checkpoint_every=%d, views_per_step=%d, rasterizer=%s, max_gaussians=%d, min_gaussians=%d, "
         "point_chunk=%d, SSIM权重=%.3f",
         args.iters,
+        start_iter,
+        getattr(args, "checkpoint_every", 0),
         args.views_per_step,
         args.rasterizer,
         args.max_gaussians,
@@ -328,17 +390,29 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
     num_views = len(frames)
     logger.info("训练图像数量: %d, 分辨率: %dx%d", num_views, args.train_w, args.train_h)
 
-    xyz_np, rgb_np = sample_points_from_colmap(
-        points3d_path=args.points3d_path,
-        max_points=args.max_gaussians,
-        min_points=min(args.min_gaussians, args.max_gaussians // 4),
-    )
-    logger.info("初始化高斯点数: %d", xyz_np.shape[0])
+    if resume_pack is not None:
+        model = GaussianModel.from_saved_dict(resume_pack, device).to(device)
+        logger.info("恢复高斯点数: %d", model.xyz.shape[0])
+        optimizer = make_optimizer(model, args.lr_xyz, args.lr_sh, args.lr_opacity, args.lr_scale)
+        if "optimizer" in resume_pack:
+            try:
+                optimizer.load_state_dict(resume_pack["optimizer"])
+                logger.info("已加载优化器状态。")
+            except Exception as ex:  # noqa: BLE001
+                logger.warning("优化器状态与当前模型不一致，已重置优化器: %s", ex)
+    else:
+        xyz_np, rgb_np = sample_points_from_colmap(
+            points3d_path=args.points3d_path,
+            max_points=args.max_gaussians,
+            min_points=min(args.min_gaussians, args.max_gaussians // 4),
+        )
+        logger.info("初始化高斯点数: %d", xyz_np.shape[0])
 
-    xyz = torch.from_numpy(xyz_np).to(device=device, dtype=torch.float32)
-    rgb = torch.from_numpy(rgb_np).to(device=device, dtype=torch.float32)
-    model = GaussianModel(xyz=xyz, rgb=rgb).to(device)
-    optimizer = make_optimizer(model, args.lr_xyz, args.lr_sh, args.lr_opacity, args.lr_scale)
+        xyz = torch.from_numpy(xyz_np).to(device=device, dtype=torch.float32)
+        rgb = torch.from_numpy(rgb_np).to(device=device, dtype=torch.float32)
+        model = GaussianModel(xyz=xyz, rgb=rgb).to(device)
+        optimizer = make_optimizer(model, args.lr_xyz, args.lr_sh, args.lr_opacity, args.lr_scale)
+
     base_lrs = {
         "xyz": args.lr_xyz,
         "sh": args.lr_sh,
@@ -365,7 +439,18 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
     xyz_grad_accum = torch.zeros(n_pts, device=device)
     grad_denom = 0.0
 
-    pbar = tqdm(range(1, args.iters + 1), desc="Training", ncols=120)
+    if start_iter >= args.iters:
+        logger.info("已完成 iter >= 目标 iters（%d >= %d），跳过训练循环。", start_iter, args.iters)
+        ckpt_path = model_dir / "gaussians_final.pt"
+        torch.save(build_training_checkpoint(model, args, start_iter, optimizer), ckpt_path)
+        logger.info("模型保存: %s", ckpt_path)
+        return {"checkpoint": str(ckpt_path.resolve())}
+
+    pbar = tqdm(
+        range(start_iter + 1, args.iters + 1),
+        desc="Training",
+        ncols=120,
+    )
     for it in pbar:
         optimizer.zero_grad(set_to_none=True)
         total_loss = torch.zeros((), device=device)
@@ -430,7 +515,7 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
         with torch.no_grad():
             model.log_scales.data.clamp_(-5.5, -0.75)
 
-        if it % args.log_interval == 0 or it == 1:
+        if it % args.log_interval == 0 or it == start_iter + 1:
             msg = (
                 f"iter={it}/{args.iters} loss={loss_m:.6f} l1={l1_m:.6f} dssim={dss_m:.6f}"
                 + (f" lpips={lp_m:.6f}" if lpips_fn is not None else "")
@@ -474,14 +559,33 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
                 xyz_grad_accum = torch.zeros(model.xyz.shape[0], device=device)
                 grad_denom = 0.0
 
-    ckpt = model.state_for_save()
-    ckpt["train_h"] = int(args.train_h)
-    ckpt["train_w"] = int(args.train_w)
-    ckpt["iters"] = int(args.iters)
-    ckpt["mode"] = args.mode
-    ckpt["rasterizer"] = args.rasterizer
+        checkpoint_every = int(getattr(args, "checkpoint_every", 0) or 0)
+        if checkpoint_every > 0 and it % checkpoint_every == 0 and it < args.iters:
+            mid_path = model_dir / f"gaussians_iter_{it:07d}.pt"
+            payload = build_training_checkpoint(model, args, it, optimizer)
+            torch.save(payload, mid_path)
+            torch.save(payload, model_dir / "gaussians_latest.pt")
+            logger.info("已保存中间 checkpoint: %s", mid_path)
+            if not getattr(args, "no_render_on_checkpoint", False):
+                out_r = ensure_dir(render_root / f"iter_{it:07d}")
+                try:
+                    render_comparisons(
+                        checkpoint_path=str(mid_path),
+                        transforms_path=args.transforms_path,
+                        output_dir=str(out_r),
+                        render_h=args.render_h,
+                        render_w=args.render_w,
+                        min_views=max(args.render_views, 8),
+                        device_str=args.device,
+                        log_file=str(logs_dir / f"render_iter_{it:07d}.log"),
+                        render_point_chunk=args.render_point_chunk,
+                    )
+                    logger.info("中间对比渲染目录: %s", out_r)
+                except Exception as ex:  # noqa: BLE001
+                    logger.warning("中间渲染失败（训练继续）: %s", ex)
+
     ckpt_path = model_dir / "gaussians_final.pt"
-    torch.save(ckpt, ckpt_path)
+    torch.save(build_training_checkpoint(model, args, args.iters, optimizer), ckpt_path)
     logger.info("训练完成，模型保存: %s", ckpt_path)
     logger.info("最终高斯点数: %d", model.xyz.shape[0])
     logger.info(gpu_status_text(device) + gpu_peak_status_text(device))
@@ -489,54 +593,93 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 
 
 def pipeline(args: argparse.Namespace) -> Dict[str, str]:
-    """端到端流程：抽帧 -> COLMAP -> 训练 -> 导出 -> 渲染。"""
+    """端到端流程：抽帧 -> COLMAP -> 训练 -> 导出 -> 渲染；或 --resume 断点续训（跳过抽帧/COLMAP）。"""
     set_seed(args.seed)
 
-    run_name = args.run_name if args.run_name else f"{args.mode}_{now_str()}"
-    run_dir = ensure_dir(Path(args.output_root) / run_name)
-    logs_dir = ensure_dir(run_dir / "logs")
-    tmp_dir = ensure_dir(run_dir / "tmp")
-    frames_dir = ensure_dir(tmp_dir / "frames")
-    colmap_dir = ensure_dir(tmp_dir / "colmap")
-    render_dir = ensure_dir(run_dir / "renders")
-    model_dir = ensure_dir(run_dir / "models")
+    resume_path = (getattr(args, "resume", "") or "").strip()
+    if resume_path:
+        rp = Path(resume_path).expanduser().resolve()
+        if not rp.is_file():
+            raise FileNotFoundError(f"--resume 文件不存在: {rp}")
+        ck_head = torch.load(rp, map_location="cpu")
+        if rp.parent.name == "models":
+            run_dir = ensure_dir(rp.parent.parent)
+        else:
+            run_dir = ensure_dir(rp.parent)
+        logs_dir = ensure_dir(run_dir / "logs")
+        tmp_dir = ensure_dir(run_dir / "tmp")
+        frames_dir = ensure_dir(tmp_dir / "frames")
+        colmap_dir = ensure_dir(tmp_dir / "colmap")
+        render_dir = ensure_dir(run_dir / "renders")
+        model_dir = ensure_dir(run_dir / "models")
 
-    logger = create_logger(logs_dir / "pipeline.log", logger_name="pipeline")
-    logger.info("运行目录: %s", run_dir.resolve())
-    logger.info("运行模式: %s", args.mode)
-    logger.info("输入视频: %s", Path(args.video_path).resolve())
+        logger = create_logger(logs_dir / "pipeline.log", logger_name="pipeline")
+        logger.info("断点续训：跳过抽帧/COLMAP。resume=%s 运行目录=%s", rp, run_dir.resolve())
 
-    # Step 1: 视频抽帧
-    frame_stats = process_video(
-        input_video=args.video_path,
-        output_dir=str(frames_dir),
-        target_frames=args.target_frames,
-        min_frames=args.min_frames,
-        max_frames=args.max_frames,
-        blur_threshold=args.blur_threshold,
-        hash_distance_threshold=args.hash_distance_threshold,
-    )
-    logger.info("抽帧完成: %s", frame_stats)
-    with open(logs_dir / "frame_stats.json", "w", encoding="utf-8") as f:
-        json.dump(frame_stats, f, ensure_ascii=False, indent=2)
+        tp = ck_head.get("transforms_path")
+        pp = ck_head.get("points3d_path")
+        if not tp or not pp:
+            raise RuntimeError(
+                "checkpoint 中缺少 transforms_path / points3d_path，无法用该文件续训。"
+                "请使用本次更新后保存的中间 checkpoint（gaussians_iter_*.pt 或 gaussians_latest.pt）。"
+            )
+        args.run_dir = str(run_dir)
+        args.transforms_path = tp
+        args.points3d_path = pp
+        if ck_head.get("train_h") and ck_head.get("train_w"):
+            args.train_h = int(ck_head["train_h"])
+            args.train_w = int(ck_head["train_w"])
+        if ck_head.get("rasterizer"):
+            args.rasterizer = str(ck_head["rasterizer"])
+        train_out = run_training(args)
+    else:
+        run_name = args.run_name if args.run_name else f"{args.mode}_{now_str()}"
+        run_dir = ensure_dir(Path(args.output_root) / run_name)
+        logs_dir = ensure_dir(run_dir / "logs")
+        tmp_dir = ensure_dir(run_dir / "tmp")
+        frames_dir = ensure_dir(tmp_dir / "frames")
+        colmap_dir = ensure_dir(tmp_dir / "colmap")
+        render_dir = ensure_dir(run_dir / "renders")
+        model_dir = ensure_dir(run_dir / "models")
 
-    # Step 2: COLMAP 位姿估计
-    colmap_res = run_colmap_pipeline(
-        image_dir=str(frames_dir),
-        workspace_dir=str(colmap_dir),
-        use_gpu=1 if args.device == "cuda" else 0,
-        matcher=args.colmap_matcher,
-        logger_name="colmap",
-        log_file=str(logs_dir / "colmap.log"),
-    )
-    logger.info("COLMAP 输出: %s", colmap_res)
+        logger = create_logger(logs_dir / "pipeline.log", logger_name="pipeline")
+        logger.info("运行目录: %s", run_dir.resolve())
+        logger.info("运行模式: %s", args.mode)
+        logger.info("输入视频: %s", Path(args.video_path).resolve())
 
-    # Step 3: 训练
-    args.run_dir = str(run_dir)
-    args.transforms_path = colmap_res["transforms_path"]
-    args.points3d_path = colmap_res["points3d_path"]
-    train_out = run_training(args)
+        # Step 1: 视频抽帧
+        frame_stats = process_video(
+            input_video=args.video_path,
+            output_dir=str(frames_dir),
+            target_frames=args.target_frames,
+            min_frames=args.min_frames,
+            max_frames=args.max_frames,
+            blur_threshold=args.blur_threshold,
+            hash_distance_threshold=args.hash_distance_threshold,
+        )
+        logger.info("抽帧完成: %s", frame_stats)
+        with open(logs_dir / "frame_stats.json", "w", encoding="utf-8") as f:
+            json.dump(frame_stats, f, ensure_ascii=False, indent=2)
+
+        # Step 2: COLMAP 位姿估计
+        colmap_res = run_colmap_pipeline(
+            image_dir=str(frames_dir),
+            workspace_dir=str(colmap_dir),
+            use_gpu=1 if args.device == "cuda" else 0,
+            matcher=args.colmap_matcher,
+            logger_name="colmap",
+            log_file=str(logs_dir / "colmap.log"),
+        )
+        logger.info("COLMAP 输出: %s", colmap_res)
+
+        # Step 3: 训练
+        args.run_dir = str(run_dir)
+        args.transforms_path = colmap_res["transforms_path"]
+        args.points3d_path = colmap_res["points3d_path"]
+        train_out = run_training(args)
+
     checkpoint = train_out["checkpoint"]
+    transforms_for_render = args.transforms_path
 
     # Step 4: 导出模型
     export_res = export_from_checkpoint(
@@ -549,7 +692,7 @@ def pipeline(args: argparse.Namespace) -> Dict[str, str]:
     # Step 5: 渲染对比图
     render_res = render_comparisons(
         checkpoint_path=checkpoint,
-        transforms_path=colmap_res["transforms_path"],
+        transforms_path=transforms_for_render,
         output_dir=str(render_dir),
         render_h=args.render_h,
         render_w=args.render_w,
@@ -566,7 +709,7 @@ def pipeline(args: argparse.Namespace) -> Dict[str, str]:
         "model_ply": export_res["ply"],
         "model_splat": export_res["splat"],
         "render_meta": render_res["render_meta"],
-        "transforms": colmap_res["transforms_path"],
+        "transforms": transforms_for_render,
     }
     with open(run_dir / "run_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
@@ -625,6 +768,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prune_interval", type=int, default=500, help="剪枝间隔")
     parser.add_argument("--opacity_prune_threshold", type=float, default=0.014, help="透明度剪枝基准阈值")
     parser.add_argument("--log_interval", type=int, default=50, help="训练日志间隔")
+    parser.add_argument(
+        "--checkpoint_every",
+        type=int,
+        default=10000,
+        help="每隔 N iter 保存 models/gaussians_iter_XXXXXXX.pt 与 gaussians_latest.pt；0 关闭",
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default="",
+        help="从已有 .pt 断点续训（需含 global_step 与 transforms_path 等；pipeline 会跳过抽帧/COLMAP）",
+    )
+    parser.add_argument(
+        "--no_render_on_checkpoint",
+        action="store_true",
+        help="中间 checkpoint 保存后不生成对比渲染（节省时间与显存）",
+    )
     return parser.parse_args()
 
 
