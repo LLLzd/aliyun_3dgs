@@ -55,10 +55,10 @@ bash setup.sh
 
 1. 系统检测（OS、GPU、CUDA）；
 2. 安装系统依赖（`ffmpeg`、`colmap`、`python3.10-venv` 等）；
-3. 创建并激活 `.venv`；
-4. 安装 `requirements.txt`；
-5. 强制安装 CUDA 11.8 对应的 PyTorch（`torch==2.1.2+cu118`）；
-6. 运行环境校验（Torch CUDA 可用性、`ffmpeg` 和 `colmap` 命令检测）。
+3. 直接使用系统 Python 环境（不创建 `.venv`）；
+4. 安装 `requirements.txt` 中除 `torch/torchvision` 外的依赖；
+5. 保留镜像预装 PyTorch，仅做 Torch CUDA 可用性校验；
+6. 运行环境校验（`ffmpeg` 和 `colmap` 命令检测）。
 
 ---
 
@@ -84,28 +84,24 @@ input/object.MOV
 ### 5.1 完整重建（推荐，20~40 分钟）
 
 ```bash
-source .venv/bin/activate
 python train.py --mode full --video_path input/object.MOV --output_root output
 ```
 
 或：
 
 ```bash
-source .venv/bin/activate
 bash run_all.sh full
 ```
 
 ### 5.2 快速验证（约 2 分钟）
 
 ```bash
-source .venv/bin/activate
 python train.py --mode quick --video_path input/object.MOV --output_root output
 ```
 
 或：
 
 ```bash
-source .venv/bin/activate
 bash run_all.sh quick
 ```
 
@@ -285,7 +281,6 @@ python export_model.py \
 ```bash
 cd /path/to/aliyun_3dgs
 bash setup.sh
-source .venv/bin/activate
 python train.py --mode full --video_path input/object.MOV --output_root output
 ```
 

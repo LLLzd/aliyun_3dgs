@@ -4,15 +4,13 @@ set -euo pipefail
 # ============================================
 # 阿里云 A10-30G + 4CPU 环境一键部署脚本
 # - 安装系统依赖（COLMAP / FFmpeg 等）
-# - 创建 Python venv
-# - 安装 CUDA 11.8 对应 PyTorch
-# - 安装项目依赖 requirements.txt
+# - 直接使用镜像内 Python 环境（不创建 venv）
+# - 保留镜像自带 Torch（不强制重装）
+# - 安装项目其余 Python 依赖
 # ============================================
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="${PROJECT_ROOT}/.venv"
 PYTHON_BIN="${PYTHON_BIN:-python3.10}"
-PIP_BIN=""
 
 red()   { echo -e "\033[31m[ERROR]\033[0m $*"; }
 green() { echo -e "\033[32m[INFO]\033[0m $*"; }
@@ -83,43 +81,45 @@ install_system_deps() {
     libgl1 \
     libglib2.0-0 \
     python3.10 \
-    python3.10-venv \
     python3-pip
 }
 
-setup_venv() {
+check_python() {
   if ! check_cmd "${PYTHON_BIN}"; then
     red "未找到 ${PYTHON_BIN}，请先安装 Python 3.10。"
     exit 1
   fi
-
-  if [[ ! -d "${VENV_DIR}" ]]; then
-    green "创建虚拟环境: ${VENV_DIR}"
-    "${PYTHON_BIN}" -m venv "${VENV_DIR}"
-  else
-    green "复用已有虚拟环境: ${VENV_DIR}"
-  fi
-
-  # shellcheck disable=SC1090
-  source "${VENV_DIR}/bin/activate"
-  PIP_BIN="${VENV_DIR}/bin/pip"
-  python --version
-  "${PIP_BIN}" install --upgrade pip setuptools wheel
+  green "使用 Python: $("${PYTHON_BIN}" --version)"
+  "${PYTHON_BIN}" -m pip install --upgrade pip setuptools wheel
 }
 
-install_python_deps() {
-  green "安装 Python 依赖..."
-  "${PIP_BIN}" install -r "${PROJECT_ROOT}/requirements.txt"
+install_python_deps_without_torch() {
+  green "安装 Python 依赖（跳过 torch/torchvision，使用镜像预装版本）..."
 
-  green "安装 CUDA 11.8 版本 PyTorch（A10 推荐）..."
-  "${PIP_BIN}" install --upgrade --force-reinstall \
-    torch==2.1.2 torchvision==0.16.2 \
-    --index-url https://download.pytorch.org/whl/cu118
+  local filtered_req="${PROJECT_ROOT}/.requirements.no_torch.txt"
+  "${PYTHON_BIN}" - <<PY
+from pathlib import Path
+
+src = Path("${PROJECT_ROOT}/requirements.txt")
+dst = Path("${PROJECT_ROOT}/.requirements.no_torch.txt")
+lines = src.read_text(encoding="utf-8").splitlines()
+keep = []
+for ln in lines:
+    s = ln.strip().lower()
+    if s.startswith("torch==") or s.startswith("torchvision=="):
+        continue
+    keep.append(ln)
+dst.write_text("\\n".join(keep) + "\\n", encoding="utf-8")
+print(f"生成过滤依赖文件: {dst}")
+PY
+
+  "${PYTHON_BIN}" -m pip install -r "${filtered_req}"
+  rm -f "${filtered_req}"
 }
 
 verify_runtime() {
   green "执行运行时校验..."
-  python - <<'PY'
+  "${PYTHON_BIN}" - <<'PY'
 import shutil
 import torch
 
@@ -141,16 +141,13 @@ print_next_steps() {
   green "环境部署完成。"
   cat <<EOF
 后续使用方式：
-1) 激活虚拟环境
-   source "${VENV_DIR}/bin/activate"
-
-2) 将视频放到:
+1) 将视频放到:
    ${PROJECT_ROOT}/input/object.MOV
 
-3) 一键运行完整重建:
+2) 一键运行完整重建:
    python "${PROJECT_ROOT}/train.py" --mode full --video_path "${PROJECT_ROOT}/input/object.MOV" --output_root "${PROJECT_ROOT}/output"
 
-4) 快速验证（约 2 分钟）:
+3) 快速验证（约 2 分钟）:
    python "${PROJECT_ROOT}/train.py" --mode quick --video_path "${PROJECT_ROOT}/input/object.MOV" --output_root "${PROJECT_ROOT}/output"
 EOF
 }
@@ -160,8 +157,8 @@ main() {
   check_gpu
   check_cuda
   install_system_deps
-  setup_venv
-  install_python_deps
+  check_python
+  install_python_deps_without_torch
   verify_runtime
   print_next_steps
 }
