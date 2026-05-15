@@ -19,6 +19,31 @@ import torch
 from utils import ensure_dir
 
 
+def scales_to_xyz_per_point(scales: np.ndarray) -> np.ndarray:
+    """
+    将训练中的尺度张量统一为 [N, 3]，供 .splat 写入三个 float。
+    训练里 log_scales 常为各向同性 [N, 1]，原先按 ndim==2 直接 tolist() 会得到单元素列表导致解包失败。
+    """
+    s = np.asarray(scales, dtype=np.float32)
+    if s.ndim == 1:
+        s = np.repeat(s[:, np.newaxis], 3, axis=1)
+    elif s.ndim == 2:
+        n, c = s.shape
+        if c == 1:
+            s = np.repeat(s, 3, axis=1)
+        elif c == 3:
+            pass
+        elif c == 2:
+            s = np.concatenate([s, s[:, -1:]], axis=1)
+        elif c > 3:
+            s = s[:, :3]
+        else:
+            raise ValueError(f"不支持的 scales 形状: {s.shape}")
+    else:
+        raise ValueError(f"不支持的 scales 形状: {s.shape}")
+    return s
+
+
 def load_checkpoint(path: str) -> Dict[str, np.ndarray]:
     """读取训练输出模型，并转为 numpy。"""
     ckpt = torch.load(path, map_location="cpu")
@@ -72,12 +97,14 @@ def export_splat(path: str | Path, xyz: np.ndarray, rgb: np.ndarray, opacity: np
     rgb_u8 = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
     alpha_u8 = np.clip(opacity * 255.0, 0, 255).astype(np.uint8).reshape(-1)
 
+    scales_xyz = scales_to_xyz_per_point(scales)
+
     with open(path, "wb") as f:
         f.write(b"SPLAT1")
         f.write(struct.pack("<I", xyz.shape[0]))
         for i in range(xyz.shape[0]):
             x, y, z = xyz[i].tolist()
-            sx, sy, sz = scales[i].tolist() if scales.ndim == 2 else [float(scales[i])] * 3
+            sx, sy, sz = scales_xyz[i].tolist()
             r, g, b = rgb_u8[i].tolist()
             a = int(alpha_u8[i])
             qx, qy, qz, qw = 0.0, 0.0, 0.0, 1.0
