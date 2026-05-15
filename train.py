@@ -24,6 +24,9 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 
+import loss_utils
+import raster_gsplat
+import sh_utils
 from colmap_process import run_colmap_pipeline
 from export_model import export_from_checkpoint
 from render import render_comparisons
@@ -32,8 +35,8 @@ from utils import (
     camera_to_torch,
     create_logger,
     ensure_dir,
+    gpu_peak_status_text,
     gpu_status_text,
-    inverse_sigmoid,
     load_transforms_json,
     now_str,
     read_image_rgb_crop_resize,
@@ -45,37 +48,37 @@ from video2img import process_video
 
 class GaussianModel(nn.Module):
     """
-    轻量高斯模型：
-    - xyz: 高斯中心；
-    - rgb_logits: 颜色参数（通过 sigmoid 映射到 [0,1]）；
-    - opacity_logits: 不透明度；
-    - log_scales: 尺度（各向同性，压缩为 1 维）。
+    高斯模型：球谐颜色 deg≤2（N,9,3）、不透明度、各向同性尺度。
     """
 
     def __init__(self, xyz: torch.Tensor, rgb: torch.Tensor):
         super().__init__()
         self.xyz = nn.Parameter(xyz.clone())
-        self.rgb_logits = nn.Parameter(inverse_sigmoid(rgb.clone()))
+        dc = sh_utils.rgb_to_sh0(rgb)
+        sh = torch.zeros(xyz.shape[0], 9, 3, device=xyz.device, dtype=torch.float32)
+        sh[:, 0, :] = dc
+        self.sh_coeffs = nn.Parameter(sh)
         self.opacity_logits = nn.Parameter(torch.zeros((xyz.shape[0], 1), dtype=torch.float32, device=xyz.device))
-        # 略大的初始尺度，训练初期更容易盖住画面（配合 render 里 scale_gain）
         self.log_scales = nn.Parameter(torch.full((xyz.shape[0], 1), -2.85, dtype=torch.float32, device=xyz.device))
 
     @property
     def rgb(self) -> torch.Tensor:
-        return torch.sigmoid(self.rgb_logits)
+        """由 SH DC 还原的近似 RGB（用于导出/兼容）。"""
+        return sh_utils.sh0_to_rgb(self.sh_coeffs[:, 0, :])
 
     def prune(self, keep_mask: torch.Tensor) -> None:
-        """按 mask 裁剪高斯点，降低显存并提高训练稳定性。"""
+        """按 mask 裁剪高斯点。"""
         with torch.no_grad():
             self.xyz = nn.Parameter(self.xyz[keep_mask].detach())
-            self.rgb_logits = nn.Parameter(self.rgb_logits[keep_mask].detach())
+            self.sh_coeffs = nn.Parameter(self.sh_coeffs[keep_mask].detach())
             self.opacity_logits = nn.Parameter(self.opacity_logits[keep_mask].detach())
             self.log_scales = nn.Parameter(self.log_scales[keep_mask].detach())
 
     def state_for_save(self) -> Dict[str, torch.Tensor]:
-        """导出保存字段。"""
+        """导出：含 sh_coeffs 与由 DC 近似的 rgb。"""
         return {
             "xyz": self.xyz.detach().cpu(),
+            "sh_coeffs": self.sh_coeffs.detach().cpu(),
             "rgb": self.rgb.detach().cpu(),
             "opacity_logits": self.opacity_logits.detach().cpu(),
             "log_scales": self.log_scales.detach().cpu(),
@@ -127,12 +130,14 @@ def load_training_data(
     return resized_frames, images
 
 
-def make_optimizer(model: GaussianModel, lr_xyz: float, lr_color: float, lr_opacity: float, lr_scale: float) -> optim.Optimizer:
-    """创建优化器（点位、颜色、透明度、尺度分别配置学习率）。"""
+def make_optimizer(
+    model: GaussianModel, lr_xyz: float, lr_sh: float, lr_opacity: float, lr_scale: float
+) -> optim.Optimizer:
+    """创建优化器（xyz / SH / 透明度 / 尺度）。"""
     return optim.Adam(
         [
             {"params": [model.xyz], "lr": lr_xyz},
-            {"params": [model.rgb_logits], "lr": lr_color},
+            {"params": [model.sh_coeffs], "lr": lr_sh},
             {"params": [model.opacity_logits], "lr": lr_opacity},
             {"params": [model.log_scales], "lr": lr_scale},
         ],
@@ -146,18 +151,23 @@ def maybe_prune(
     opacity_threshold: float,
     max_points: int,
 ) -> bool:
-    """根据透明度和上限执行剪枝。"""
+    """
+    透明度剪枝 + 上限裁剪；若按阈值会低于 min_points，则自动放宽阈值，避免长期卡死在下限。
+    """
     with torch.no_grad():
         opacity = torch.sigmoid(model.opacity_logits).squeeze(-1)
-        keep = opacity > opacity_threshold
-        if keep.sum().item() < min_points:
-            return False
+        n = model.xyz.shape[0]
 
-        if int(keep.sum().item()) < model.xyz.shape[0]:
-            model.prune(keep)
-            return True
+        for factor in (1.0, 0.5, 0.25, 0.1, 0.05):
+            thr = opacity_threshold * factor
+            keep = opacity > thr
+            if int(keep.sum().item()) >= min_points:
+                if int(keep.sum().item()) < n:
+                    model.prune(keep)
+                    return True
+                break
 
-        if model.xyz.shape[0] > max_points:
+        if n > max_points:
             k = max_points
             topk = torch.topk(opacity, k=k, largest=True).indices
             keep2 = torch.zeros_like(opacity, dtype=torch.bool)
@@ -167,23 +177,147 @@ def maybe_prune(
     return False
 
 
+def densify_and_clone(
+    model: GaussianModel,
+    xyz_grad_avg: torch.Tensor,
+    grad_denom: float,
+    max_points: int,
+    grad_thresh: float,
+    size_thresh: float,
+) -> bool:
+    """
+    简易增密：高平均梯度 + 小尺度 -> clone；高平均梯度 + 大尺度 -> split（二分裂+缩小尺度）。
+    返回是否修改了模型。
+    """
+    with torch.no_grad():
+        if grad_denom <= 0:
+            return False
+        gavg = xyz_grad_avg / max(grad_denom, 1.0)
+        scales = torch.exp(model.log_scales).squeeze(-1)
+        mask_clone = (gavg > grad_thresh) & (scales < size_thresh)
+        mask_split = (gavg > grad_thresh) & (scales >= size_thresh)
+
+        n_before = model.xyz.shape[0]
+        new_xyz_list = []
+        new_sh_list = []
+        new_op_list = []
+        new_sc_list = []
+
+        if mask_clone.any():
+            idx = torch.nonzero(mask_clone, as_tuple=False).squeeze(-1)
+            # 预算：不超过 max_points
+            room = max_points - n_before
+            if room > 0:
+                idx = idx[:room]
+                dup_xyz = model.xyz[idx] + torch.randn_like(model.xyz[idx]) * 1e-4
+                new_xyz_list.append(dup_xyz)
+                new_sh_list.append(model.sh_coeffs[idx].clone())
+                new_op_list.append(model.opacity_logits[idx].clone())
+                new_sc_list.append(model.log_scales[idx].clone())
+
+        if mask_split.any():
+            idx = torch.nonzero(mask_split, as_tuple=False).squeeze(-1)
+            room = max_points - n_before - sum(x.shape[0] for x in new_xyz_list)
+            if room > 1:
+                idx = idx[: max(0, room // 2)]
+                if idx.numel() > 0:
+                    base = model.xyz[idx]
+                    off = torch.randn_like(base) * scales[idx].unsqueeze(-1) * 0.08
+                    split_xyz = torch.cat([base + off, base - off], dim=0)
+                    sh_dup = model.sh_coeffs[idx]
+                    split_sh = torch.cat([sh_dup, sh_dup], dim=0)
+                    split_op = torch.cat([model.opacity_logits[idx], model.opacity_logits[idx]], dim=0)
+                    split_sc = torch.cat(
+                        [model.log_scales[idx] - 0.25, model.log_scales[idx] - 0.25],
+                        dim=0,
+                    )
+                    new_xyz_list.append(split_xyz)
+                    new_sh_list.append(split_sh)
+                    new_op_list.append(split_op)
+                    new_sc_list.append(split_sc)
+
+        if not new_xyz_list:
+            return False
+
+        new_xyz = torch.cat(new_xyz_list, dim=0)
+        new_sh = torch.cat(new_sh_list, dim=0)
+        new_op = torch.cat(new_op_list, dim=0)
+        new_sc = torch.cat(new_sc_list, dim=0)
+
+        if n_before + new_xyz.shape[0] > max_points:
+            # 截断新增
+            allow = max_points - n_before
+            new_xyz = new_xyz[:allow]
+            new_sh = new_sh[:allow]
+            new_op = new_op[:allow]
+            new_sc = new_sc[:allow]
+
+        model.xyz = nn.Parameter(torch.cat([model.xyz, new_xyz], dim=0))
+        model.sh_coeffs = nn.Parameter(torch.cat([model.sh_coeffs, new_sh], dim=0))
+        model.opacity_logits = nn.Parameter(torch.cat([model.opacity_logits, new_op], dim=0))
+        model.log_scales = nn.Parameter(torch.cat([model.log_scales, new_sc], dim=0))
+        return True
+
+
+def forward_rgb_image(
+    model: GaussianModel,
+    cam: Dict[str, torch.Tensor],
+    train_h: int,
+    train_w: int,
+    args: argparse.Namespace,
+) -> torch.Tensor:
+    """单视角前向，返回 (H,W,3)。"""
+    if args.rasterizer == "gsplat":
+        if not raster_gsplat.is_gsplat_available():
+            raise RuntimeError("已选择 --rasterizer gsplat 但未安装 gsplat，请 pip install gsplat 或改用 pytorch。")
+        w2c, K = raster_gsplat.camera_dict_to_gsplat(cam, train_h, train_w)
+        cc = sh_utils.camera_center_from_w2c(w2c)
+        dirs = torch.nn.functional.normalize(cc.unsqueeze(0) - model.xyz, dim=-1, eps=1e-6)
+        colors = sh_utils.eval_sh_deg2(dirs, model.sh_coeffs)
+        quat = torch.zeros(model.xyz.shape[0], 4, device=model.xyz.device, dtype=model.xyz.dtype)
+        quat[:, 0] = 1.0  # wxyz: 单位四元数
+        sc = torch.exp(model.log_scales).expand(-1, 3)
+        op = torch.sigmoid(model.opacity_logits).squeeze(-1)
+        return raster_gsplat.render_gsplat_rgb(model.xyz, quat, sc, op, colors, w2c, K, train_w, train_h)
+    return render_gaussians_bilinear(
+        model.xyz,
+        None,
+        model.opacity_logits,
+        model.log_scales,
+        cam,
+        train_h,
+        train_w,
+        sh_coeffs=model.sh_coeffs,
+        point_chunk=args.render_point_chunk,
+    )
+
+
 def run_training(args: argparse.Namespace) -> Dict[str, str]:
-    """训练流程（仅训练阶段，输入数据应已准备完毕）。"""
+    """训练流程：多视角 batch、SSIM、余弦 LR、增密/剪枝、峰值显存日志。"""
     device = torch.device("cuda" if torch.cuda.is_available() and args.device == "cuda" else "cpu")
     run_dir = Path(args.run_dir)
     logs_dir = ensure_dir(run_dir / "logs")
     model_dir = ensure_dir(run_dir / "models")
     logger = create_logger(logs_dir / "train.log", logger_name="train")
 
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+    if args.rasterizer == "gsplat" and not raster_gsplat.is_gsplat_available():
+        raise RuntimeError("已选择 --rasterizer gsplat 但未安装 gsplat。请 pip install gsplat 后重试，或改用 --rasterizer pytorch。")
+
     logger.info("训练设备: %s", device)
-    logger.info(gpu_status_text(device))
+    logger.info(gpu_status_text(device) + gpu_peak_status_text(device))
     logger.info(
-        "训练形式说明: 本实现为「随机单帧」迭代优化（无 epoch）；每步随机选 1 张图做 loss，"
-        "总步数 iters=%d 即约 %d 次前向；高斯数量上限 max_gaussians=%d、下限 min_gaussians=%d（剪枝后会变化，见日志 gaussians=）。",
+        "训练: iters=%d, views_per_step=%d, rasterizer=%s, max_gaussians=%d, min_gaussians=%d, "
+        "point_chunk=%d, SSIM权重=%.3f",
         args.iters,
-        args.iters,
+        args.views_per_step,
+        args.rasterizer,
         args.max_gaussians,
         args.min_gaussians,
+        args.render_point_chunk,
+        args.ssim_weight,
     )
 
     frames, images = load_training_data(
@@ -191,65 +325,141 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
         target_h=args.train_h,
         target_w=args.train_w,
     )
-    logger.info("训练图像数量: %d, 分辨率: %dx%d", len(frames), args.train_w, args.train_h)
+    num_views = len(frames)
+    logger.info("训练图像数量: %d, 分辨率: %dx%d", num_views, args.train_w, args.train_h)
 
     xyz_np, rgb_np = sample_points_from_colmap(
         points3d_path=args.points3d_path,
         max_points=args.max_gaussians,
-        min_points=args.min_gaussians,
+        min_points=min(args.min_gaussians, args.max_gaussians // 4),
     )
     logger.info("初始化高斯点数: %d", xyz_np.shape[0])
 
     xyz = torch.from_numpy(xyz_np).to(device=device, dtype=torch.float32)
     rgb = torch.from_numpy(rgb_np).to(device=device, dtype=torch.float32)
     model = GaussianModel(xyz=xyz, rgb=rgb).to(device)
-    optimizer = make_optimizer(model, args.lr_xyz, args.lr_color, args.lr_opacity, args.lr_scale)
+    optimizer = make_optimizer(model, args.lr_xyz, args.lr_sh, args.lr_opacity, args.lr_scale)
+    base_lrs = {
+        "xyz": args.lr_xyz,
+        "sh": args.lr_sh,
+        "opacity": args.lr_opacity,
+        "scale": args.lr_scale,
+    }
+
+    lpips_fn = None
+    if args.use_lpips:
+        try:
+            import lpips as _lpips  # type: ignore
+
+            lpips_fn = _lpips.LPIPS(net="vgg").to(device)
+            for p in lpips_fn.parameters():
+                p.requires_grad = False
+            logger.info("已启用 LPIPS 损失。")
+        except ImportError:
+            logger.warning("未安装 lpips，忽略 --use_lpips。可执行: pip install lpips")
 
     image_tensors = [img.to(device=device, dtype=torch.float32) for img in images]
     frame_cams = [camera_to_torch(fr, device=device) for fr in frames]
 
+    n_pts = model.xyz.shape[0]
+    xyz_grad_accum = torch.zeros(n_pts, device=device)
+    grad_denom = 0.0
+
     pbar = tqdm(range(1, args.iters + 1), desc="Training", ncols=120)
     for it in pbar:
         optimizer.zero_grad(set_to_none=True)
-        idx = random.randint(0, len(frame_cams) - 1)
-        cam = frame_cams[idx]
-        gt = image_tensors[idx]
+        total_loss = torch.zeros((), device=device)
+        l1_acc = 0.0
+        dss_acc = 0.0
+        lp_acc = 0.0
 
-        pred = render_gaussians_bilinear(
-            xyz=model.xyz,
-            rgb=model.rgb,
-            opacity_logits=model.opacity_logits,
-            log_scales=model.log_scales,
-            camera=cam,
-            image_h=args.train_h,
-            image_w=args.train_w,
-            bg_color=(1.0, 1.0, 1.0),
-        )
+        for _ in range(args.views_per_step):
+            idx = random.randint(0, num_views - 1)
+            cam = frame_cams[idx]
+            gt = image_tensors[idx]
+            pred = forward_rgb_image(model, cam, args.train_h, args.train_w, args)
 
-        l1 = torch.mean(torch.abs(pred - gt))
-        # 轻微正则：略降 opacity 正则，便于半透明高斯铺满背景区域、减轻“未填满”空洞。
-        opacity_reg = 3e-5 * torch.mean(torch.sigmoid(model.opacity_logits))
-        scale_reg = 8e-5 * torch.mean(torch.exp(model.log_scales))
-        loss = l1 + opacity_reg + scale_reg
-        loss.backward()
+            l1 = torch.mean(torch.abs(pred - gt))
+            pred_b = pred.permute(2, 0, 1).unsqueeze(0)
+            gt_b = gt.permute(2, 0, 1).unsqueeze(0)
+            dss = loss_utils.dssim_loss(pred_b, gt_b)
+            step_loss = (1.0 - args.ssim_weight) * l1 + args.ssim_weight * dss
 
-        # 防止异常梯度引发 NaN。
+            if lpips_fn is not None:
+                lp = lpips_fn(pred_b * 2.0 - 1.0, gt_b * 2.0 - 1.0).mean()
+                step_loss = step_loss + args.lpips_weight * lp
+                lp_acc += float(lp.detach().item())
+
+            opacity_reg = 3e-5 * torch.mean(torch.sigmoid(model.opacity_logits))
+            scale_reg = 8e-5 * torch.mean(torch.exp(model.log_scales))
+            step_loss = step_loss + opacity_reg + scale_reg
+
+            total_loss = total_loss + step_loss
+            l1_acc += float(l1.detach().item())
+            dss_acc += float(dss.detach().item())
+
+        total_loss = total_loss / args.views_per_step
+        l1_m = l1_acc / args.views_per_step
+        dss_m = dss_acc / args.views_per_step
+        lp_m = lp_acc / args.views_per_step if lpips_fn is not None else 0.0
+
+        total_loss.backward()
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        if model.xyz.grad is not None:
+            with torch.no_grad():
+                g = model.xyz.grad.detach().abs().sum(dim=-1)
+                if g.shape[0] == xyz_grad_accum.shape[0]:
+                    xyz_grad_accum += g
+                    grad_denom += 1.0
+
         optimizer.step()
 
-        # 每轮限制尺度范围；上限略放宽，使屏幕空间 splat 更大、画面更易铺满。
+        # 余弦学习率（按全局 iter，不依赖 scheduler 对象，便于剪枝后重建优化器）
+        t = (it - 1) / max(args.iters - 1, 1)
+        cosf = 0.5 * (1.0 + math.cos(math.pi * t))
+        with torch.no_grad():
+            optimizer.param_groups[0]["lr"] = args.lr_min + (base_lrs["xyz"] - args.lr_min) * cosf
+            optimizer.param_groups[1]["lr"] = args.lr_min + (base_lrs["sh"] - args.lr_min) * cosf
+            optimizer.param_groups[2]["lr"] = args.lr_min + (base_lrs["opacity"] - args.lr_min) * cosf
+            optimizer.param_groups[3]["lr"] = args.lr_min + (base_lrs["scale"] - args.lr_min) * cosf
+
+        loss_m = float(total_loss.detach().item())
+
         with torch.no_grad():
             model.log_scales.data.clamp_(-5.5, -0.75)
 
         if it % args.log_interval == 0 or it == 1:
             msg = (
-                f"iter={it}/{args.iters} "
-                f"loss={loss.item():.6f} l1={l1.item():.6f} "
-                f"gaussians={model.xyz.shape[0]} "
-                f"{gpu_status_text(device)}"
+                f"iter={it}/{args.iters} loss={loss_m:.6f} l1={l1_m:.6f} dssim={dss_m:.6f}"
+                + (f" lpips={lp_m:.6f}" if lpips_fn is not None else "")
+                + f" gaussians={model.xyz.shape[0]} {gpu_status_text(device)}{gpu_peak_status_text(device)}"
             )
             logger.info(msg)
-            pbar.set_postfix(loss=f"{loss.item():.5f}", points=model.xyz.shape[0])
+            pbar.set_postfix(loss=f"{loss_m:.5f}", points=model.xyz.shape[0])
+
+        # 增密（在剪枝前执行，便于点数增长）
+        if (
+            args.densify_interval > 0
+            and it >= args.densify_from
+            and it % args.densify_interval == 0
+            and args.rasterizer == "pytorch"
+        ):
+            did = densify_and_clone(
+                model=model,
+                xyz_grad_avg=xyz_grad_accum,
+                grad_denom=grad_denom,
+                max_points=args.max_gaussians,
+                grad_thresh=args.densify_grad_thresh,
+                size_thresh=args.densify_size_thresh,
+            )
+            if did:
+                optimizer = make_optimizer(model, args.lr_xyz, args.lr_sh, args.lr_opacity, args.lr_scale)
+                # 重建 scheduler 步数对齐剩余迭代较复杂，此处仅重置优化器；scheduler 保持全局 T_max
+                logger.info("增密后高斯点数: %d", model.xyz.shape[0])
+            xyz_grad_accum = torch.zeros(model.xyz.shape[0], device=device)
+            grad_denom = 0.0
 
         if it % args.prune_interval == 0 and it >= args.prune_start:
             pruned = maybe_prune(
@@ -259,19 +469,22 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
                 max_points=args.max_gaussians,
             )
             if pruned:
-                optimizer = make_optimizer(model, args.lr_xyz, args.lr_color, args.lr_opacity, args.lr_scale)
-                logger.info("执行剪枝后高斯点数: %d", model.xyz.shape[0])
+                optimizer = make_optimizer(model, args.lr_xyz, args.lr_sh, args.lr_opacity, args.lr_scale)
+                logger.info("剪枝后高斯点数: %d", model.xyz.shape[0])
+                xyz_grad_accum = torch.zeros(model.xyz.shape[0], device=device)
+                grad_denom = 0.0
 
     ckpt = model.state_for_save()
     ckpt["train_h"] = int(args.train_h)
     ckpt["train_w"] = int(args.train_w)
     ckpt["iters"] = int(args.iters)
     ckpt["mode"] = args.mode
+    ckpt["rasterizer"] = args.rasterizer
     ckpt_path = model_dir / "gaussians_final.pt"
     torch.save(ckpt, ckpt_path)
     logger.info("训练完成，模型保存: %s", ckpt_path)
     logger.info("最终高斯点数: %d", model.xyz.shape[0])
-    logger.info(gpu_status_text(device))
+    logger.info(gpu_status_text(device) + gpu_peak_status_text(device))
     return {"checkpoint": str(ckpt_path.resolve())}
 
 
@@ -343,6 +556,7 @@ def pipeline(args: argparse.Namespace) -> Dict[str, str]:
         min_views=max(args.render_views, 8),
         device_str=args.device,
         log_file=str(logs_dir / "render.log"),
+        render_point_chunk=args.render_point_chunk,
     )
     logger.info("渲染完成: %s", render_res)
 
@@ -378,21 +592,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--colmap_matcher", type=str, default="sequential", choices=["sequential", "exhaustive"], help="COLMAP 匹配器")
 
     # 训练参数
-    parser.add_argument("--iters", type=int, default=13500, help="训练迭代总步数（非 epoch；full 默认加强）")
-    parser.add_argument("--train_h", type=int, default=512, help="训练图像高度（默认 512，中心正方形裁剪后缩放）")
-    parser.add_argument("--train_w", type=int, default=512, help="训练图像宽度（须与 train_h 一致为正方形管线）")
+    parser.add_argument(
+        "--rasterizer",
+        type=str,
+        default="pytorch",
+        choices=["pytorch", "gsplat"],
+        help="pytorch=可微2x2 splat（默认）；gsplat=高质量CUDA光栅（需 pip install gsplat）",
+    )
+    parser.add_argument("--iters", type=int, default=50000, help="训练外层迭代步数（每步可含多视角）")
+    parser.add_argument("--train_h", type=int, default=512, help="训练图像高度（中心正方形裁剪后缩放）")
+    parser.add_argument("--train_w", type=int, default=512, help="训练图像宽度")
     parser.add_argument("--render_h", type=int, default=512, help="对比图渲染高度")
     parser.add_argument("--render_w", type=int, default=512, help="对比图渲染宽度")
     parser.add_argument("--render_views", type=int, default=8, help="对比图视角数量（至少 8）")
-    parser.add_argument("--max_gaussians", type=int, default=96000, help="高斯点上限（A10-30G full 加强默认）")
-    parser.add_argument("--min_gaussians", type=int, default=15000, help="高斯点下限（避免剪枝过狠导致画面空）")
-    parser.add_argument("--lr_xyz", type=float, default=0.00135, help="xyz 学习率")
-    parser.add_argument("--lr_color", type=float, default=0.0032, help="颜色学习率")
-    parser.add_argument("--lr_opacity", type=float, default=0.0022, help="透明度学习率")
-    parser.add_argument("--lr_scale", type=float, default=0.00115, help="尺度学习率")
-    parser.add_argument("--prune_start", type=int, default=2200, help="开始剪枝迭代（略延后利于铺色）")
+    parser.add_argument("--max_gaussians", type=int, default=200000, help="高斯点上限")
+    parser.add_argument("--min_gaussians", type=int, default=12000, help="剪枝保留下限（配合增密）")
+    parser.add_argument("--lr_xyz", type=float, default=0.00135, help="xyz 学习率峰值")
+    parser.add_argument("--lr_sh", type=float, default=0.0025, help="球谐系数学习率峰值")
+    parser.add_argument("--lr_opacity", type=float, default=0.0022, help="透明度学习率峰值")
+    parser.add_argument("--lr_scale", type=float, default=0.00115, help="尺度学习率峰值")
+    parser.add_argument("--lr_min", type=float, default=2e-5, help="余弦退火最小学习率")
+    parser.add_argument("--views_per_step", type=int, default=4, help="每步随机采样的视角数（堆叠显存）")
+    parser.add_argument("--render_point_chunk", type=int, default=65536, help="渲染时每批点数，0 表示不分块")
+    parser.add_argument("--ssim_weight", type=float, default=0.25, help="D-SSIM 项权重（其余为 L1）")
+    parser.add_argument("--lpips_weight", type=float, default=0.05, help="LPIPS 权重（需 --use_lpips）")
+    parser.add_argument("--use_lpips", action="store_true", help="启用 LPIPS（需 pip install lpips）")
+    parser.add_argument("--densify_from", type=int, default=500, help="开始增密的迭代")
+    parser.add_argument("--densify_interval", type=int, default=350, help="增密间隔，0 关闭")
+    parser.add_argument("--densify_grad_thresh", type=float, default=2e-4, help="平均位置梯度阈值")
+    parser.add_argument("--densify_size_thresh", type=float, default=0.012, help="尺度判据：小于则 clone，否则 split")
+    parser.add_argument("--prune_start", type=int, default=2200, help="开始剪枝迭代")
     parser.add_argument("--prune_interval", type=int, default=500, help="剪枝间隔")
-    parser.add_argument("--opacity_prune_threshold", type=float, default=0.014, help="透明度剪枝阈值（越低保留越多，利于填满）")
+    parser.add_argument("--opacity_prune_threshold", type=float, default=0.014, help="透明度剪枝基准阈值")
     parser.add_argument("--log_interval", type=int, default=50, help="训练日志间隔")
     return parser.parse_args()
 
@@ -417,20 +648,26 @@ def apply_mode_preset(args: argparse.Namespace) -> argparse.Namespace:
         args.prune_start = min(args.prune_start, 120)
         args.prune_interval = min(args.prune_interval, 80)
         args.log_interval = min(args.log_interval, 20)
+        args.views_per_step = min(args.views_per_step, 1)
+        args.render_point_chunk = min(args.render_point_chunk, 12000) if args.render_point_chunk else 12000
+        args.densify_interval = 0
+        args.rasterizer = "pytorch"
     elif args.mode == "full":
-        # 在命令行未改得更保守的前提下，抬高 full 下限（仍可用更小参数显式覆盖）
-        args.iters = max(args.iters, 13500)
+        args.iters = max(args.iters, 60000)
         args.train_h = max(args.train_h, 512)
         args.train_w = max(args.train_w, 512)
         args.render_h = max(args.render_h, 512)
         args.render_w = max(args.render_w, 512)
-        args.max_gaussians = max(args.max_gaussians, 96000)
-        args.min_gaussians = max(args.min_gaussians, 15000)
+        args.max_gaussians = max(args.max_gaussians, 300000)
+        args.min_gaussians = max(args.min_gaussians, 8000)
         args.target_frames = max(args.target_frames, 128)
         args.min_frames = max(args.min_frames, 110)
         args.max_frames = max(args.max_frames, 150)
         args.opacity_prune_threshold = min(args.opacity_prune_threshold, 0.014)
         args.prune_start = max(args.prune_start, 2200)
+        args.views_per_step = max(args.views_per_step, 4)
+        if args.render_point_chunk <= 0:
+            args.render_point_chunk = 65536
 
     # 训练/对比渲染统一为正方形，与「中心正方形裁剪 + 缩放」一致
     if args.train_h != args.train_w:

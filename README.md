@@ -6,7 +6,7 @@
 - 自动流程：抽帧 -> COLMAP 位姿估计 -> 轻量 3DGS 训练 -> 模型导出 -> 多角度渲染对比；
 - 输出：`output/<run_name>/` 下的模型文件（`.pt/.ply/.splat`）、至少 8 张对比图、训练日志与运行摘要。
 
-> 说明：实现采用纯 Python + PyTorch 的轻量可微 splat 渲染，参考 Compact-3DGS 的“点数控制 + 显存稳定”思路，避免复杂 CUDA 自定义编译步骤，优先保证 A10 环境可快速落地。
+> 说明：默认训练为 **PyTorch 可微 splat + 球谐颜色 + 多视角 + SSIM**；可选 **`--rasterizer gsplat`** 使用 CUDA 光栅化（需单独安装 `gsplat`）。增密/剪枝与显存分块用于在 A10-30G 上拉高上限。
 
 ---
 
@@ -19,6 +19,9 @@ aliyun_3dgs/
 ├── output/                     # 输出目录（自动生成每次运行子目录）
 │   └── .gitkeep
 ├── utils.py                    # 公共工具：日志、命令执行、可微渲染、显存统计等
+├── sh_utils.py                 # 球谐 SH deg≤2 与相机中心工具
+├── loss_utils.py               # SSIM / D-SSIM 损失
+├── raster_gsplat.py            # 可选 gsplat 光栅封装
 ├── video2img.py                # 视频抽帧：去模糊、去重复，输出 100~150 张
 ├── colmap_process.py           # COLMAP 自动 SfM，导出 transforms.json + points3d.npz
 ├── train.py                    # 主脚本：端到端一键流程（quick/full）
@@ -177,12 +180,16 @@ python train.py --mode full --video_path input/object.MOV --output_root output
 
 关键参数：
 
-- `--mode quick|full`：快速验证 / 完整训练；
-- `--iters`：迭代次数；
-- `--max_gaussians`：高斯点上限（防 OOM）；
+- `--mode quick|full`：快速验证 / 完整训练（full 默认更长迭代、更多高斯、多视角与 SSIM）；
+- `--rasterizer pytorch|gsplat`：`pytorch` 为默认可微 splat；`gsplat` 为高质量光栅（需 `pip install gsplat`）；
+- `--iters`：外层迭代步数；`--views_per_step`：每步随机视角数（增大吃显存）；
+- `--render_point_chunk`：渲染时每批高斯点数（分块降峰值显存，0 为不分块）；
+- `--ssim_weight` / `--use_lpips` / `--lpips_weight`：感知损失组合；
+- `--densify_interval` / `--densify_from` / `--densify_grad_thresh` / `--densify_size_thresh`：增密（仅 `pytorch` 后端）；
+- `--max_gaussians` / `--min_gaussians`：点数上下限与剪枝；
 - `--train_h --train_w`：训练输出边长（默认 **512×512**）；当二者相等时，对原图做**以画面中心为基准的正方形裁剪**（边长 `min(宽,高)`），再缩放到该边长，不拉伸；
-- `--render_h --render_w`：对比图边长（默认 512；若与训练不一致，同样按中心正方形裁剪逻辑处理）；
-- `--render_views`：渲染输出视角数量（至少 8）。
+- `--render_h --render_w`：对比图边长（默认 512）；
+- `--render_views`：对比图视角数量（至少 8）。
 
 ### 7.4 `render.py`
 

@@ -14,3 +14,7 @@ einops==0.8.0
 # 这里保留版本声明用于依赖锁定与检查。
 torch==2.1.2
 torchvision==0.16.2
+
+# 可选：更高质量（需与 CUDA/torch 版本匹配，自行 pip 安装）
+# lpips
+# gsplat

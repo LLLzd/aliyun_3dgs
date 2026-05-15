@@ -93,6 +93,7 @@ def render_comparisons(
     min_views: int = 8,
     device_str: str = "cuda",
     log_file: str | None = None,
+    render_point_chunk: int = 65536,
 ) -> Dict[str, str]:
     """对外主函数：根据模型输出对比图。"""
     out_dir = ensure_dir(output_dir)
@@ -106,9 +107,15 @@ def render_comparisons(
     device = torch.device(device_str if torch.cuda.is_available() and device_str == "cuda" else "cpu")
 
     xyz = ckpt["xyz"].to(device=device, dtype=torch.float32)
-    rgb = ckpt["rgb"].to(device=device, dtype=torch.float32)
     opacity_logits = ckpt["opacity_logits"].to(device=device, dtype=torch.float32)
     log_scales = ckpt["log_scales"].to(device=device, dtype=torch.float32)
+    sh_coeffs = ckpt.get("sh_coeffs")
+    if sh_coeffs is not None:
+        sh_coeffs = sh_coeffs.to(device=device, dtype=torch.float32)
+        rgb_t = None
+    else:
+        rgb_t = ckpt["rgb"].to(device=device, dtype=torch.float32)
+        sh_coeffs = None
 
     # 分辨率以训练时记录为准；如未记录则采用用户指定或原图尺寸。
     train_h = ckpt.get("train_h", None)
@@ -128,13 +135,15 @@ def render_comparisons(
         cam = camera_to_torch(fr, device=device)
         pred = render_gaussians_soft_splat_compare(
             xyz=xyz,
-            rgb=rgb,
+            rgb=rgb_t,
             opacity_logits=opacity_logits,
             log_scales=log_scales,
             camera=cam,
             image_h=render_h,
             image_w=render_w,
             bg_color=(1.0, 1.0, 1.0),
+            sh_coeffs=sh_coeffs,
+            point_chunk=render_point_chunk if render_point_chunk > 0 else 0,
         )
         pred_np = pred.detach().cpu().numpy()
         gt_np = read_image_rgb_crop_resize(
@@ -174,6 +183,7 @@ def main() -> None:
     parser.add_argument("--min_views", type=int, default=8, help="最少视角数量（至少 8）")
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"], help="渲染设备")
     parser.add_argument("--log_file", type=str, default="output/logs/render.log", help="日志文件")
+    parser.add_argument("--render_point_chunk", type=int, default=65536, help="对比渲染分块点数，0 为整图")
     args = parser.parse_args()
 
     render_comparisons(
@@ -185,6 +195,7 @@ def main() -> None:
         min_views=max(args.min_views, 8),
         device_str=args.device,
         log_file=args.log_file,
+        render_point_chunk=args.render_point_chunk,
     )
 
 

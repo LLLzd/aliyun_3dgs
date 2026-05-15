@@ -26,6 +26,8 @@ import cv2
 import numpy as np
 import torch
 
+import sh_utils
+
 
 def set_seed(seed: int) -> None:
     """设置随机种子，保证实验可复现。"""
@@ -94,6 +96,14 @@ def gpu_status_text(device: torch.device) -> str:
     reserved = torch.cuda.memory_reserved(device) / 1024**3
     total = torch.cuda.get_device_properties(device).total_memory / 1024**3
     return f"GPU显存: 已分配 {alloc:.2f}GB / 预留 {reserved:.2f}GB / 总计 {total:.2f}GB"
+
+
+def gpu_peak_status_text(device: torch.device) -> str:
+    """自上次 reset_peak_memory_stats 以来的峰值已分配显存（更贴近「是否吃满」）。"""
+    if device.type != "cuda":
+        return ""
+    peak = torch.cuda.max_memory_allocated(device) / 1024**3
+    return f" 峰值已分配 {peak:.2f}GB"
 
 
 def center_crop_rect(src_w: int, src_h: int, tgt_w: int, tgt_h: int) -> Tuple[int, int, int, int]:
@@ -330,111 +340,125 @@ def load_transforms_json(path: str | Path) -> List[CameraFrame]:
 
 def render_gaussians_bilinear(
     xyz: torch.Tensor,
-    rgb: torch.Tensor,
+    rgb: torch.Tensor | None,
     opacity_logits: torch.Tensor,
     log_scales: torch.Tensor,
     camera: Dict[str, torch.Tensor],
     image_h: int,
     image_w: int,
     bg_color: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+    sh_coeffs: torch.Tensor | None = None,
+    point_chunk: int = 0,
 ) -> torch.Tensor:
     """
     轻量级可微渲染器（双线性 splat）。
 
-    原理简述（Compact 思路的轻量近似）：
-    1) 将 3D 高斯中心投影到 2D；
-    2) 使用双线性权重分配到邻近 4 个像素；
-    3) 使用深度衰减 + opacity 形成权重；
-    4) 对颜色进行 scatter 累积，最后按权重归一化。
-
-    优点：
-    - 全流程可微分；
-    - 纯 PyTorch，无需自定义 CUDA 编译；
-    - 显存开销可控，适合 A10-30G + 4CPU 的自动化部署。
+    - 若提供 ``sh_coeffs`` (N,9,3)，则按视线方向用 SH deg≤2 计算 RGB（多视角更一致）；
+      此时 ``rgb`` 可传 ``None``。
+    - ``point_chunk>0`` 时按点数分块累加，降低峰值显存。
     """
     device = xyz.device
+    N = xyz.shape[0]
 
-    w2c = camera["w2c"]  # [4, 4]
+    if sh_coeffs is not None:
+        w2c = camera["w2c"]
+        cc = sh_utils.camera_center_from_w2c(w2c)
+        view_dir = torch.nn.functional.normalize(cc.unsqueeze(0) - xyz, dim=-1, eps=1e-6)
+        rgb_all = sh_utils.eval_sh_deg2(view_dir, sh_coeffs)
+    else:
+        if rgb is None:
+            raise ValueError("rgb 与 sh_coeffs 必须二选一非空")
+        rgb_all = rgb
+
+    chunk = int(point_chunk) if point_chunk and point_chunk > 0 else N
+
+    accum_color = torch.zeros((image_h * image_w, 3), device=device)
+    accum_alpha = torch.zeros((image_h * image_w, 1), device=device)
+
+    w2c = camera["w2c"]
     fx = camera["fx"]
     fy = camera["fy"]
     cx = camera["cx"]
     cy = camera["cy"]
 
-    xyz_h = torch.cat([xyz, torch.ones_like(xyz[:, :1])], dim=1)  # [N, 4]
-    cam_xyz_h = xyz_h @ w2c.t()  # [N, 4]
-    cam_xyz = cam_xyz_h[:, :3]
+    for s in range(0, N, chunk):
+        e = min(s + chunk, N)
+        xyz_c = xyz[s:e]
+        rgb_c = rgb_all[s:e]
+        op_c = opacity_logits[s:e]
+        sc_c = log_scales[s:e]
 
-    z = cam_xyz[:, 2]
-    valid = z > 1e-4
-    if valid.sum() == 0:
-        bg = torch.tensor(bg_color, device=device).view(1, 1, 3).repeat(image_h, image_w, 1)
-        return bg
+        xyz_h = torch.cat([xyz_c, torch.ones_like(xyz_c[:, :1])], dim=1)
+        cam_xyz_h = xyz_h @ w2c.t()
+        cam_xyz = cam_xyz_h[:, :3]
 
-    cam_xyz = cam_xyz[valid]
-    z = z[valid]
-    rgb = rgb[valid]
-    opacity = torch.sigmoid(opacity_logits[valid]).squeeze(-1)
-    scales = torch.exp(log_scales[valid]).squeeze(-1)
+        z = cam_xyz[:, 2]
+        valid = z > 1e-4
+        if valid.sum() == 0:
+            continue
 
-    u = fx * (cam_xyz[:, 0] / z) + cx
-    v = fy * (cam_xyz[:, 1] / z) + cy
+        cam_xyz = cam_xyz[valid]
+        z = z[valid]
+        rgb_v = rgb_c[valid]
+        opacity = torch.sigmoid(op_c[valid]).squeeze(-1)
+        scales = torch.exp(sc_c[valid]).squeeze(-1)
 
-    in_view = (u >= 0.0) & (u <= image_w - 1.001) & (v >= 0.0) & (v <= image_h - 1.001)
-    if in_view.sum() == 0:
-        bg = torch.tensor(bg_color, device=device).view(1, 1, 3).repeat(image_h, image_w, 1)
-        return bg
+        u = fx * (cam_xyz[:, 0] / z) + cx
+        v = fy * (cam_xyz[:, 1] / z) + cy
 
-    u = u[in_view]
-    v = v[in_view]
-    z = z[in_view]
-    rgb = rgb[in_view]
-    opacity = opacity[in_view]
-    scales = scales[in_view]
+        in_view = (u >= 0.0) & (u <= image_w - 1.001) & (v >= 0.0) & (v <= image_h - 1.001)
+        if in_view.sum() == 0:
+            continue
 
-    x0 = torch.floor(u).long()
-    y0 = torch.floor(v).long()
-    dx = u - x0.float()
-    dy = v - y0.float()
+        u = u[in_view]
+        v = v[in_view]
+        z = z[in_view]
+        rgb_v = rgb_v[in_view]
+        opacity = opacity[in_view]
+        scales = scales[in_view]
 
-    # 屏幕空间 footprint：略增大以便覆盖空洞、减轻“画面未填满”（仍保持可微近似）
-    scale_gain = torch.clamp(scales * 105.0, 0.55, 4.8)
-    depth_gain = torch.exp(-0.011 * z)
-    base_weight = opacity * scale_gain * depth_gain
+        x0 = torch.floor(u).long()
+        y0 = torch.floor(v).long()
+        dx = u - x0.float()
+        dy = v - y0.float()
 
-    all_x = torch.stack([x0, x0 + 1, x0, x0 + 1], dim=1)
-    all_y = torch.stack([y0, y0, y0 + 1, y0 + 1], dim=1)
-    all_w = torch.stack(
-        [
-            (1.0 - dx) * (1.0 - dy),
-            dx * (1.0 - dy),
-            (1.0 - dx) * dy,
-            dx * dy,
-        ],
-        dim=1,
-    )
-    all_w = all_w * base_weight.unsqueeze(1)
+        scale_gain = torch.clamp(scales * 105.0, 0.55, 4.8)
+        depth_gain = torch.exp(-0.011 * z)
+        base_weight = opacity * scale_gain * depth_gain
 
-    valid_px = (all_x >= 0) & (all_x < image_w) & (all_y >= 0) & (all_y < image_h)
+        all_x = torch.stack([x0, x0 + 1, x0, x0 + 1], dim=1)
+        all_y = torch.stack([y0, y0, y0 + 1, y0 + 1], dim=1)
+        all_w = torch.stack(
+            [
+                (1.0 - dx) * (1.0 - dy),
+                dx * (1.0 - dy),
+                (1.0 - dx) * dy,
+                dx * dy,
+            ],
+            dim=1,
+        )
+        all_w = all_w * base_weight.unsqueeze(1)
 
-    flat_idx = (all_y * image_w + all_x).view(-1)
-    flat_w = all_w.view(-1)
-    flat_valid = valid_px.view(-1)
-    owner = torch.arange(rgb.shape[0], device=device).repeat_interleave(4)
+        valid_px = (all_x >= 0) & (all_x < image_w) & (all_y >= 0) & (all_y < image_h)
 
-    flat_idx = flat_idx[flat_valid]
-    flat_w = flat_w[flat_valid]
-    owner = owner[flat_valid]
+        flat_idx = (all_y * image_w + all_x).view(-1)
+        flat_w = all_w.view(-1)
+        flat_valid = valid_px.view(-1)
+        owner = torch.arange(rgb_v.shape[0], device=device, dtype=torch.long).repeat_interleave(4)
 
-    accum_color = torch.zeros((image_h * image_w, 3), device=device)
-    accum_alpha = torch.zeros((image_h * image_w, 1), device=device)
+        flat_idx = flat_idx[flat_valid]
+        flat_w = flat_w[flat_valid]
+        owner = owner[flat_valid]
 
-    contrib_color = flat_w.unsqueeze(1) * rgb[owner]
-    contrib_alpha = flat_w.unsqueeze(1)
+        contrib_color = flat_w.unsqueeze(1) * rgb_v[owner]
+        contrib_alpha = flat_w.unsqueeze(1)
 
-    accum_color.index_add_(0, flat_idx, contrib_color)
-    accum_alpha.index_add_(0, flat_idx, contrib_alpha)
+        accum_color.index_add_(0, flat_idx, contrib_color)
+        accum_alpha.index_add_(0, flat_idx, contrib_alpha)
 
     bg = torch.tensor(bg_color, device=device).view(1, 3)
+    if float(accum_alpha.max().item()) <= 1e-8:
+        return torch.tensor(bg_color, device=device).view(1, 1, 3).repeat(image_h, image_w, 1)
     pred = accum_color / (accum_alpha + 1e-6)
     empty = (accum_alpha <= 1e-6).float()
     pred = pred * (1.0 - empty) + bg * empty
@@ -444,7 +468,7 @@ def render_gaussians_bilinear(
 
 def render_gaussians_soft_splat_compare(
     xyz: torch.Tensor,
-    rgb: torch.Tensor,
+    rgb: torch.Tensor | None,
     opacity_logits: torch.Tensor,
     log_scales: torch.Tensor,
     camera: Dict[str, torch.Tensor],
@@ -453,53 +477,32 @@ def render_gaussians_soft_splat_compare(
     bg_color: Tuple[float, float, float] = (1.0, 1.0, 1.0),
     radius: int = 3,
     chunk_size: int = 4096,
+    sh_coeffs: torch.Tensor | None = None,
+    point_chunk: int = 0,
 ) -> torch.Tensor:
     """
     用于「对比图」的柔和光栅化（不参与 train 反传时可 no_grad 调用）。
-
-    与 2×2 双线性 splat 不同：在屏幕空间对每个高斯做 (2r+1)² 的权重衰减，
-    使能量在邻域内铺开，避免对比图里出现明显「球点/颗粒」观感，更接近连续图像。
-
-    训练仍使用 render_gaussians_bilinear 以保证速度与可微开销可控。
+    支持 SH 颜色与按点数分块（point_chunk），与 bilinear 路径一致。
     """
     device = xyz.device
+    N = xyz.shape[0]
+
+    if sh_coeffs is not None:
+        w2c = camera["w2c"]
+        cc = sh_utils.camera_center_from_w2c(w2c)
+        view_dir = torch.nn.functional.normalize(cc.unsqueeze(0) - xyz, dim=-1, eps=1e-6)
+        rgb_all = sh_utils.eval_sh_deg2(view_dir, sh_coeffs)
+    else:
+        if rgb is None:
+            raise ValueError("rgb 与 sh_coeffs 必须二选一非空")
+        rgb_all = rgb
+
+    pchunk = int(point_chunk) if point_chunk and point_chunk > 0 else N
     w2c = camera["w2c"]
     fx = camera["fx"]
     fy = camera["fy"]
     cx = camera["cx"]
     cy = camera["cy"]
-
-    xyz_h = torch.cat([xyz, torch.ones_like(xyz[:, :1])], dim=1)
-    cam_xyz_h = xyz_h @ w2c.t()
-    cam_xyz = cam_xyz_h[:, :3]
-    z = cam_xyz[:, 2]
-    valid = z > 1e-4
-    if valid.sum() == 0:
-        bg = torch.tensor(bg_color, device=device).view(1, 1, 3).repeat(image_h, image_w, 1)
-        return bg
-
-    cam_xyz = cam_xyz[valid]
-    z = z[valid]
-    rgb = rgb[valid]
-    opacity = torch.sigmoid(opacity_logits[valid]).squeeze(-1)
-    scales = torch.exp(log_scales[valid]).squeeze(-1)
-
-    u = fx * (cam_xyz[:, 0] / z) + cx
-    v = fy * (cam_xyz[:, 1] / z) + cy
-    in_view = (u >= float(radius)) & (u <= image_w - 1.0 - radius) & (v >= float(radius)) & (v <= image_h - 1.0 - radius)
-    if in_view.sum() == 0:
-        bg = torch.tensor(bg_color, device=device).view(1, 1, 3).repeat(image_h, image_w, 1)
-        return bg
-
-    u = u[in_view]
-    v = v[in_view]
-    z = z[in_view]
-    rgb = rgb[in_view]
-    opacity = opacity[in_view]
-    scales = scales[in_view]
-
-    depth_gain = torch.exp(-0.012 * z)
-    sigma = torch.clamp(fx * scales / (z + 1e-6) * 1.28, 1.1, 7.0)
 
     offs = torch.arange(-radius, radius + 1, device=device, dtype=torch.long)
     oy, ox = torch.meshgrid(offs, offs, indexing="ij")
@@ -510,45 +513,84 @@ def render_gaussians_soft_splat_compare(
     accum_color = torch.zeros((image_h * image_w, 3), device=device)
     accum_w = torch.zeros((image_h * image_w, 1), device=device)
 
-    n = u.shape[0]
-    for start in range(0, n, chunk_size):
-        end = min(start + chunk_size, n)
-        uc = u[start:end]
-        vc = v[start:end]
-        zc = z[start:end]
-        rc = rgb[start:end]
-        opc = opacity[start:end]
-        sig = sigma[start:end]
-        dg = depth_gain[start:end]
-        m = uc.shape[0]
+    for ps in range(0, N, pchunk):
+        pe = min(ps + pchunk, N)
+        xyz_c = xyz[ps:pe]
+        rgb_c = rgb_all[ps:pe]
+        op_c = opacity_logits[ps:pe]
+        sc_c = log_scales[ps:pe]
 
-        uf = torch.floor(uc).long()
-        vf = torch.floor(vc).long()
-        ix = uf[:, None] + ox[None, :]
-        iy = vf[:, None] + oy[None, :]
-        cxp = ix.float() + 0.5
-        cyp = iy.float() + 0.5
-        dist2 = (cxp - uc[:, None]) ** 2 + (cyp - vc[:, None]) ** 2
-        sig2 = (sig[:, None] ** 2) * 2.0 + 1e-6
-        gw = torch.exp(-dist2 / sig2)
-        w = opc[:, None] * dg[:, None] * gw
+        xyz_h = torch.cat([xyz_c, torch.ones_like(xyz_c[:, :1])], dim=1)
+        cam_xyz_h = xyz_h @ w2c.t()
+        cam_xyz = cam_xyz_h[:, :3]
+        z = cam_xyz[:, 2]
+        valid = z > 1e-4
+        if valid.sum() == 0:
+            continue
 
-        valid_px = (ix >= 0) & (ix < image_w) & (iy >= 0) & (iy < image_h)
-        flat_idx = (iy * image_w + ix).reshape(-1)
-        flat_w = w.reshape(-1)
-        flat_ok = valid_px.reshape(-1)
-        own = torch.arange(m, device=device, dtype=torch.long)[:, None].expand(-1, k).reshape(-1)
+        cam_xyz = cam_xyz[valid]
+        z = z[valid]
+        rgb_v = rgb_c[valid]
+        opacity = torch.sigmoid(op_c[valid]).squeeze(-1)
+        scales = torch.exp(sc_c[valid]).squeeze(-1)
 
-        flat_idx = flat_idx[flat_ok]
-        flat_w = flat_w[flat_ok]
-        own = own[flat_ok]
+        u = fx * (cam_xyz[:, 0] / z) + cx
+        v = fy * (cam_xyz[:, 1] / z) + cy
+        in_view = (u >= float(radius)) & (u <= image_w - 1.0 - radius) & (v >= float(radius)) & (v <= image_h - 1.0 - radius)
+        if in_view.sum() == 0:
+            continue
 
-        contrib_c = flat_w.unsqueeze(1) * rc[own]
-        contrib_w = flat_w.unsqueeze(1)
-        accum_color.index_add_(0, flat_idx, contrib_c)
-        accum_w.index_add_(0, flat_idx, contrib_w)
+        u = u[in_view]
+        v = v[in_view]
+        z = z[in_view]
+        rgb_v = rgb_v[in_view]
+        opacity = opacity[in_view]
+        scales = scales[in_view]
+
+        depth_gain = torch.exp(-0.012 * z)
+        sigma = torch.clamp(fx * scales / (z + 1e-6) * 1.28, 1.1, 7.0)
+
+        n = u.shape[0]
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            uc = u[start:end]
+            vc = v[start:end]
+            zc = z[start:end]
+            rc = rgb_v[start:end]
+            opc = opacity[start:end]
+            sig = sigma[start:end]
+            dg = depth_gain[start:end]
+            m = uc.shape[0]
+
+            uf = torch.floor(uc).long()
+            vf = torch.floor(vc).long()
+            ix = uf[:, None] + ox[None, :]
+            iy = vf[:, None] + oy[None, :]
+            cxp = ix.float() + 0.5
+            cyp = iy.float() + 0.5
+            dist2 = (cxp - uc[:, None]) ** 2 + (cyp - vc[:, None]) ** 2
+            sig2 = (sig[:, None] ** 2) * 2.0 + 1e-6
+            gw = torch.exp(-dist2 / sig2)
+            w = opc[:, None] * dg[:, None] * gw
+
+            valid_px = (ix >= 0) & (ix < image_w) & (iy >= 0) & (iy < image_h)
+            flat_idx = (iy * image_w + ix).reshape(-1)
+            flat_w = w.reshape(-1)
+            flat_ok = valid_px.reshape(-1)
+            own = torch.arange(m, device=device, dtype=torch.long)[:, None].expand(-1, k).reshape(-1)
+
+            flat_idx = flat_idx[flat_ok]
+            flat_w = flat_w[flat_ok]
+            own = own[flat_ok]
+
+            contrib_c = flat_w.unsqueeze(1) * rc[own]
+            contrib_w = flat_w.unsqueeze(1)
+            accum_color.index_add_(0, flat_idx, contrib_c)
+            accum_w.index_add_(0, flat_idx, contrib_w)
 
     bg = torch.tensor(bg_color, device=device).view(1, 3)
+    if float(accum_w.max().item()) <= 1e-8:
+        return torch.tensor(bg_color, device=device).view(1, 1, 3).repeat(image_h, image_w, 1)
     pred = accum_color / (accum_w + 1e-6)
     empty = (accum_w <= 1e-6).float()
     pred = pred * (1.0 - empty) + bg * empty

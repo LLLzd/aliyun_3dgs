@@ -16,6 +16,7 @@ from typing import Dict
 import numpy as np
 import torch
 
+import sh_utils
 from utils import ensure_dir
 
 
@@ -48,7 +49,11 @@ def load_checkpoint(path: str) -> Dict[str, np.ndarray]:
     """读取训练输出模型，并转为 numpy。"""
     ckpt = torch.load(path, map_location="cpu")
     xyz = ckpt["xyz"].detach().cpu().numpy().astype(np.float32)
-    rgb = ckpt["rgb"].detach().cpu().numpy().astype(np.float32)
+    if "sh_coeffs" in ckpt:
+        sh = ckpt["sh_coeffs"].detach().cpu()
+        rgb = sh_utils.sh0_to_rgb(sh[:, 0, :]).numpy().astype(np.float32)
+    else:
+        rgb = ckpt["rgb"].detach().cpu().numpy().astype(np.float32)
     opacity = torch.sigmoid(ckpt["opacity_logits"]).detach().cpu().numpy().astype(np.float32)
     scales = torch.exp(ckpt["log_scales"]).detach().cpu().numpy().astype(np.float32)
     return {"xyz": xyz, "rgb": rgb, "opacity": opacity, "scales": scales}
