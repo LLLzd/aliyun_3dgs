@@ -57,7 +57,8 @@ class GaussianModel(nn.Module):
         self.xyz = nn.Parameter(xyz.clone())
         self.rgb_logits = nn.Parameter(inverse_sigmoid(rgb.clone()))
         self.opacity_logits = nn.Parameter(torch.zeros((xyz.shape[0], 1), dtype=torch.float32, device=xyz.device))
-        self.log_scales = nn.Parameter(torch.full((xyz.shape[0], 1), -3.0, dtype=torch.float32, device=xyz.device))
+        # 略大的初始尺度，训练初期更容易盖住画面（配合 render 里 scale_gain）
+        self.log_scales = nn.Parameter(torch.full((xyz.shape[0], 1), -2.85, dtype=torch.float32, device=xyz.device))
 
     @property
     def rgb(self) -> torch.Tensor:
@@ -105,7 +106,7 @@ def sample_points_from_colmap(
     if xyz.shape[0] < min_points:
         need = min_points - xyz.shape[0]
         pick = np.random.choice(xyz.shape[0], size=need, replace=True)
-        jitter = np.random.normal(scale=0.0025, size=(need, 3)).astype(np.float32)
+        jitter = np.random.normal(scale=0.004, size=(need, 3)).astype(np.float32)
         xyz = np.concatenate([xyz, xyz[pick] + jitter], axis=0)
         rgb = np.concatenate([rgb, rgb[pick]], axis=0)
     return xyz.astype(np.float32), np.clip(rgb.astype(np.float32), 0.0, 1.0)
@@ -176,6 +177,14 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 
     logger.info("训练设备: %s", device)
     logger.info(gpu_status_text(device))
+    logger.info(
+        "训练形式说明: 本实现为「随机单帧」迭代优化（无 epoch）；每步随机选 1 张图做 loss，"
+        "总步数 iters=%d 即约 %d 次前向；高斯数量上限 max_gaussians=%d、下限 min_gaussians=%d（剪枝后会变化，见日志 gaussians=）。",
+        args.iters,
+        args.iters,
+        args.max_gaussians,
+        args.min_gaussians,
+    )
 
     frames, images = load_training_data(
         transforms_path=args.transforms_path,
@@ -218,9 +227,9 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
         )
 
         l1 = torch.mean(torch.abs(pred - gt))
-        # 轻微正则：抑制过高 opacity，避免“涂抹式”填充。
-        opacity_reg = 1e-4 * torch.mean(torch.sigmoid(model.opacity_logits))
-        scale_reg = 1e-4 * torch.mean(torch.exp(model.log_scales))
+        # 轻微正则：略降 opacity 正则，便于半透明高斯铺满背景区域、减轻“未填满”空洞。
+        opacity_reg = 3e-5 * torch.mean(torch.sigmoid(model.opacity_logits))
+        scale_reg = 8e-5 * torch.mean(torch.exp(model.log_scales))
         loss = l1 + opacity_reg + scale_reg
         loss.backward()
 
@@ -228,9 +237,9 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        # 每轮限制尺度范围，防止爆炸。
+        # 每轮限制尺度范围；上限略放宽，使屏幕空间 splat 更大、画面更易铺满。
         with torch.no_grad():
-            model.log_scales.data.clamp_(-6.0, -1.0)
+            model.log_scales.data.clamp_(-5.5, -0.75)
 
         if it % args.log_interval == 0 or it == 1:
             msg = (
@@ -369,21 +378,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--colmap_matcher", type=str, default="sequential", choices=["sequential", "exhaustive"], help="COLMAP 匹配器")
 
     # 训练参数
-    parser.add_argument("--iters", type=int, default=7000, help="训练迭代次数（full 默认约 20~40 分钟）")
-    parser.add_argument("--train_h", type=int, default=360, help="训练图像高度")
-    parser.add_argument("--train_w", type=int, default=640, help="训练图像宽度")
-    parser.add_argument("--render_h", type=int, default=540, help="对比图渲染高度")
-    parser.add_argument("--render_w", type=int, default=960, help="对比图渲染宽度")
+    parser.add_argument("--iters", type=int, default=13500, help="训练迭代总步数（非 epoch；full 默认加强）")
+    parser.add_argument("--train_h", type=int, default=512, help="训练图像高度（默认 512，中心正方形裁剪后缩放）")
+    parser.add_argument("--train_w", type=int, default=512, help="训练图像宽度（须与 train_h 一致为正方形管线）")
+    parser.add_argument("--render_h", type=int, default=512, help="对比图渲染高度")
+    parser.add_argument("--render_w", type=int, default=512, help="对比图渲染宽度")
     parser.add_argument("--render_views", type=int, default=8, help="对比图视角数量（至少 8）")
-    parser.add_argument("--max_gaussians", type=int, default=65000, help="高斯点上限（防止显存溢出）")
-    parser.add_argument("--min_gaussians", type=int, default=9000, help="高斯点下限（防止过度剪枝）")
-    parser.add_argument("--lr_xyz", type=float, default=0.0012, help="xyz 学习率")
-    parser.add_argument("--lr_color", type=float, default=0.0030, help="颜色学习率")
-    parser.add_argument("--lr_opacity", type=float, default=0.0020, help="透明度学习率")
-    parser.add_argument("--lr_scale", type=float, default=0.0010, help="尺度学习率")
-    parser.add_argument("--prune_start", type=int, default=1200, help="开始剪枝迭代")
-    parser.add_argument("--prune_interval", type=int, default=450, help="剪枝间隔")
-    parser.add_argument("--opacity_prune_threshold", type=float, default=0.03, help="透明度剪枝阈值")
+    parser.add_argument("--max_gaussians", type=int, default=96000, help="高斯点上限（A10-30G full 加强默认）")
+    parser.add_argument("--min_gaussians", type=int, default=15000, help="高斯点下限（避免剪枝过狠导致画面空）")
+    parser.add_argument("--lr_xyz", type=float, default=0.00135, help="xyz 学习率")
+    parser.add_argument("--lr_color", type=float, default=0.0032, help="颜色学习率")
+    parser.add_argument("--lr_opacity", type=float, default=0.0022, help="透明度学习率")
+    parser.add_argument("--lr_scale", type=float, default=0.00115, help="尺度学习率")
+    parser.add_argument("--prune_start", type=int, default=2200, help="开始剪枝迭代（略延后利于铺色）")
+    parser.add_argument("--prune_interval", type=int, default=500, help="剪枝间隔")
+    parser.add_argument("--opacity_prune_threshold", type=float, default=0.014, help="透明度剪枝阈值（越低保留越多，利于填满）")
     parser.add_argument("--log_interval", type=int, default=50, help="训练日志间隔")
     return parser.parse_args()
 
@@ -392,22 +401,44 @@ def apply_mode_preset(args: argparse.Namespace) -> argparse.Namespace:
     """
     模式预设：
     - quick: 2 分钟级验证，适合先检查环境/流程；
-    - full: 20~40 分钟级重建，适合最终结果。
+    - full: 加强版默认（更高分辨率、更多迭代与点数），适合 A10-30G 最终重建。
     """
     if args.mode == "quick":
         args.iters = min(args.iters, 420)
         args.target_frames = min(args.target_frames, 80)
         args.min_frames = min(args.min_frames, 60)
         args.max_frames = min(args.max_frames, 90)
-        args.train_h = min(args.train_h, 240)
-        args.train_w = min(args.train_w, 426)
-        args.render_h = min(args.render_h, 360)
-        args.render_w = min(args.render_w, 640)
+        args.train_h = min(args.train_h, 256)
+        args.train_w = min(args.train_w, 256)
+        args.render_h = min(args.render_h, 256)
+        args.render_w = min(args.render_w, 256)
         args.max_gaussians = min(args.max_gaussians, 22000)
         args.min_gaussians = min(args.min_gaussians, 6000)
         args.prune_start = min(args.prune_start, 120)
         args.prune_interval = min(args.prune_interval, 80)
         args.log_interval = min(args.log_interval, 20)
+    elif args.mode == "full":
+        # 在命令行未改得更保守的前提下，抬高 full 下限（仍可用更小参数显式覆盖）
+        args.iters = max(args.iters, 13500)
+        args.train_h = max(args.train_h, 512)
+        args.train_w = max(args.train_w, 512)
+        args.render_h = max(args.render_h, 512)
+        args.render_w = max(args.render_w, 512)
+        args.max_gaussians = max(args.max_gaussians, 96000)
+        args.min_gaussians = max(args.min_gaussians, 15000)
+        args.target_frames = max(args.target_frames, 128)
+        args.min_frames = max(args.min_frames, 110)
+        args.max_frames = max(args.max_frames, 150)
+        args.opacity_prune_threshold = min(args.opacity_prune_threshold, 0.014)
+        args.prune_start = max(args.prune_start, 2200)
+
+    # 训练/对比渲染统一为正方形，与「中心正方形裁剪 + 缩放」一致
+    if args.train_h != args.train_w:
+        s = min(args.train_h, args.train_w)
+        args.train_h = args.train_w = s
+    if args.render_h != args.render_w:
+        s = min(args.render_h, args.render_w)
+        args.render_h = args.render_w = s
     return args
 
 

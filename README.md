@@ -180,7 +180,8 @@ python train.py --mode full --video_path input/object.MOV --output_root output
 - `--mode quick|full`：快速验证 / 完整训练；
 - `--iters`：迭代次数；
 - `--max_gaussians`：高斯点上限（防 OOM）；
-- `--train_h --train_w`：训练分辨率；
+- `--train_h --train_w`：训练输出边长（默认 **512×512**）；当二者相等时，对原图做**以画面中心为基准的正方形裁剪**（边长 `min(宽,高)`），再缩放到该边长，不拉伸；
+- `--render_h --render_w`：对比图边长（默认 512；若与训练不一致，同样按中心正方形裁剪逻辑处理）；
 - `--render_views`：渲染输出视角数量（至少 8）。
 
 ### 7.4 `render.py`
@@ -229,7 +230,7 @@ python export_model.py \
 
 1. **优先使用 full 模式默认参数**：在 A10-30G 上通常可稳定运行，避免直接拉满分辨率；
 2. **显存监控**：`train.log` 会周期输出显存与高斯点数；
-3. **OOM 处理**：调小 `--max_gaussians`（如 50000）和 `--train_h/--train_w`；
+3. **OOM 处理**：调小 `--max_gaussians`（如 50000）和正方形边长，例如 `--train_h 448 --train_w 448`；
 4. **速度优化**：`--matcher sequential` + 合理抽帧（100~150）通常更快；
 5. **画质优化**：增加 `--iters`（如 9000~12000）并保证视频清晰。
 
@@ -254,7 +255,7 @@ python export_model.py \
 
 - 降低参数：
   - `--max_gaussians 45000`
-  - `--train_h 288 --train_w 512`
+  - `--train_h 448 --train_w 448`（须保持正方形；若只写一边，程序会取较小边统一为正方形）
 - 或先用 `--mode quick` 验证流程。
 
 ### Q4: 重建模糊 / 漂浮点多

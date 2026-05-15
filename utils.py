@@ -98,13 +98,25 @@ def gpu_status_text(device: torch.device) -> str:
 
 def center_crop_rect(src_w: int, src_h: int, tgt_w: int, tgt_h: int) -> Tuple[int, int, int, int]:
     """
-    按目标宽高比做中心裁剪矩形（不拉伸）：
-    - 源更“瘦高”则裁上下各一部分，使宽高比与目标一致；
-    - 源更“扁宽”则裁左右各一部分。
+    中心裁剪（不拉伸），再与目标尺寸对应做缩放用的裁剪框。
+
+    - 当 tgt_w == tgt_h（正方形输出，如 512×512）：取 **min(src_w, src_h)** 为边长的
+      中心正方形区域（图像几何中心），再缩放到 tgt。
+    - 否则：按目标宽高比 tgt_w:tgt_h 做中心裁剪（竖图多裁上下，横图多裁左右）。
     返回 (x0, y0, crop_w, crop_h)，坐标系左上角为原点。
     """
     if src_w <= 0 or src_h <= 0 or tgt_w <= 0 or tgt_h <= 0:
         raise ValueError(f"无效尺寸: src=({src_w},{src_h}) tgt=({tgt_w},{tgt_h})")
+
+    if tgt_w == tgt_h:
+        side = int(min(src_w, src_h))
+        side = max(1, side)
+        x0 = (src_w - side) // 2
+        y0 = (src_h - side) // 2
+        x0 = max(0, min(x0, src_w - side))
+        y0 = max(0, min(y0, src_h - side))
+        return int(x0), int(y0), int(side), int(side)
+
     ar_tgt = tgt_w / float(tgt_h)
     ar_src = src_w / float(src_h)
     if ar_src > ar_tgt:
@@ -128,8 +140,8 @@ def center_crop_rect(src_w: int, src_h: int, tgt_w: int, tgt_h: int) -> Tuple[in
 
 def adjust_intrinsics_crop_resize(frame: "CameraFrame", target_h: int, target_w: int) -> "CameraFrame":
     """
-    与 read_image_rgb_crop_resize 一致：先中心裁剪到目标宽高比，再缩放到 target_w×target_h，
-    同步更新 fx/fy/cx/cy（无几何拉伸）。
+    与 read_image_rgb_crop_resize 一致：先中心裁剪（正方形目标时为居中正方形），
+    再缩放到 target_w×target_h，同步更新 fx/fy/cx/cy（无几何拉伸）。
     """
     x0, y0, cw, ch = center_crop_rect(frame.w, frame.h, target_w, target_h)
     cx1 = frame.cx - float(x0)
@@ -152,7 +164,8 @@ def adjust_intrinsics_crop_resize(frame: "CameraFrame", target_h: int, target_w:
 def read_image_rgb(path: str | Path, resize_hw: Tuple[int, int] | None = None) -> np.ndarray:
     """
     读取 BGR 图并转为 RGB，返回 float32 [0,1]。
-    若指定 resize_hw=(h,w)：使用中心裁剪 + 降采样（保持比例，不拉伸）。
+    若指定 resize_hw=(h,w)：先按 center_crop_rect 做中心裁剪（h==w 时为居中正方形），
+    再 INTER_AREA 缩放到 (w,h)，无拉伸。
     """
     img = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if img is None:
@@ -175,8 +188,9 @@ def read_image_rgb_crop_resize(
     src_h: int | None = None,
 ) -> np.ndarray:
     """
-    与 COLMAP 相机记录的宽高一致时使用：按 (src_w,src_h) 计算裁剪窗口（与 adjust_intrinsics_crop_resize 相同），
-    避免磁盘上图像尺寸与标定不一致时裁错。若未传 src_w/src_h，则从读入图像实际尺寸计算。
+    与 COLMAP 相机记录的宽高一致时使用：按 (src_w,src_h) 计算裁剪窗口（与 adjust_intrinsics_crop_resize 相同）。
+    当 target_w==target_h 时为**以图像中心为基准的正方形**裁剪（边长 min(src_w,src_h)），再缩放到 target。
+    若磁盘图像与标定尺寸不一致，会将裁剪框按比例映射到像素网格。
     """
     img = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if img is None:
@@ -382,9 +396,9 @@ def render_gaussians_bilinear(
     dx = u - x0.float()
     dy = v - y0.float()
 
-    # 使用 scale 影响 splat 强度，体现高斯“大小”在投影上的粗略影响。
-    scale_gain = torch.clamp(scales * 80.0, 0.35, 2.5)
-    depth_gain = torch.exp(-0.015 * z)
+    # 屏幕空间 footprint：略增大以便覆盖空洞、减轻“画面未填满”（仍保持可微近似）
+    scale_gain = torch.clamp(scales * 105.0, 0.55, 4.8)
+    depth_gain = torch.exp(-0.011 * z)
     base_weight = opacity * scale_gain * depth_gain
 
     all_x = torch.stack([x0, x0 + 1, x0, x0 + 1], dim=1)
@@ -485,7 +499,7 @@ def render_gaussians_soft_splat_compare(
     scales = scales[in_view]
 
     depth_gain = torch.exp(-0.012 * z)
-    sigma = torch.clamp(fx * scales / (z + 1e-6) * 1.15, 1.05, 6.0)
+    sigma = torch.clamp(fx * scales / (z + 1e-6) * 1.28, 1.1, 7.0)
 
     offs = torch.arange(-radius, radius + 1, device=device, dtype=torch.long)
     oy, ox = torch.meshgrid(offs, offs, indexing="ij")
