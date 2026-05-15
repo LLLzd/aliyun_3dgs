@@ -17,14 +17,14 @@ import numpy as np
 import torch
 
 from utils import (
+    adjust_intrinsics_crop_resize,
     camera_to_torch,
     create_logger,
+    draw_compare_caption_rgb,
     ensure_dir,
     load_transforms_json,
-    read_image_rgb,
-    render_gaussians_bilinear,
-    resize_intrinsics,
-    save_rgb_image,
+    read_image_rgb_crop_resize,
+    render_gaussians_soft_splat_compare,
 )
 
 
@@ -69,20 +69,18 @@ def select_view_indices(frames: List, min_count: int = 8) -> List[Tuple[str, int
 
 
 def draw_compare(gt_rgb: np.ndarray, pred_rgb: np.ndarray, title: str, image_name: str) -> np.ndarray:
-    """拼接对比图并添加中文标签。"""
+    """左右拼接：左原图、右重建；中文标签经 PIL 绘制，避免乱码。"""
     gt_u8 = np.clip(gt_rgb * 255.0, 0, 255).astype(np.uint8)
     pred_u8 = np.clip(pred_rgb * 255.0, 0, 255).astype(np.uint8)
-
-    canvas = np.concatenate([gt_u8, pred_u8], axis=1)
-    canvas_bgr = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
-    h, w = canvas_bgr.shape[:2]
-    half = w // 2
-
-    cv2.putText(canvas_bgr, "原始视角", (20, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.95, (0, 255, 0), 2, cv2.LINE_AA)
-    cv2.putText(canvas_bgr, "重建渲染", (half + 20, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.95, (0, 200, 255), 2, cv2.LINE_AA)
-    cv2.putText(canvas_bgr, f"角度: {title}", (20, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(canvas_bgr, f"帧: {image_name}", (20, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-    return canvas_bgr
+    canvas_rgb = np.concatenate([gt_u8, pred_u8], axis=1)
+    canvas_rgb = draw_compare_caption_rgb(
+        canvas_rgb,
+        left_title="原图（视频帧）",
+        right_title="重建渲染（连续图像）",
+        bottom_line1=f"视角：{title}",
+        bottom_line2=f"帧文件：{image_name}",
+    )
+    return cv2.cvtColor(canvas_rgb, cv2.COLOR_RGB2BGR)
 
 
 @torch.no_grad()
@@ -125,9 +123,10 @@ def render_comparisons(
 
     save_paths: List[str] = []
     for idx, (view_name, frame_idx) in enumerate(selections, start=1):
-        fr = resize_intrinsics(frames[frame_idx], target_h=render_h, target_w=render_w)
+        orig_fr = frames[frame_idx]
+        fr = adjust_intrinsics_crop_resize(orig_fr, render_h, render_w)
         cam = camera_to_torch(fr, device=device)
-        pred = render_gaussians_bilinear(
+        pred = render_gaussians_soft_splat_compare(
             xyz=xyz,
             rgb=rgb,
             opacity_logits=opacity_logits,
@@ -138,8 +137,14 @@ def render_comparisons(
             bg_color=(1.0, 1.0, 1.0),
         )
         pred_np = pred.detach().cpu().numpy()
-        gt_np = read_image_rgb(fr.image_path, resize_hw=(render_h, render_w))
-        compare_bgr = draw_compare(gt_np, pred_np, title=view_name, image_name=fr.image_name)
+        gt_np = read_image_rgb_crop_resize(
+            orig_fr.image_path,
+            render_h,
+            render_w,
+            src_w=orig_fr.w,
+            src_h=orig_fr.h,
+        )
+        compare_bgr = draw_compare(gt_np, pred_np, title=view_name, image_name=orig_fr.image_name)
 
         out_path = out_dir / f"compare_{idx:02d}.png"
         cv2.imwrite(str(out_path), compare_bgr)

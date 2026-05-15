@@ -28,6 +28,7 @@ from colmap_process import run_colmap_pipeline
 from export_model import export_from_checkpoint
 from render import render_comparisons
 from utils import (
+    adjust_intrinsics_crop_resize,
     camera_to_torch,
     create_logger,
     ensure_dir,
@@ -35,9 +36,8 @@ from utils import (
     inverse_sigmoid,
     load_transforms_json,
     now_str,
-    read_image_rgb,
+    read_image_rgb_crop_resize,
     render_gaussians_bilinear,
-    resize_intrinsics,
     set_seed,
 )
 from video2img import process_video
@@ -116,12 +116,12 @@ def load_training_data(
     target_h: int,
     target_w: int,
 ) -> Tuple[List, List[torch.Tensor]]:
-    """加载相机与 GT 图像，统一分辨率。"""
+    """加载相机与 GT 图像：中心裁剪到目标宽高比后降采样，与内参一致（无拉伸）。"""
     frames = load_transforms_json(transforms_path)
-    resized_frames = [resize_intrinsics(fr, target_h=target_h, target_w=target_w) for fr in frames]
+    resized_frames = [adjust_intrinsics_crop_resize(fr, target_h, target_w) for fr in frames]
     images: List[torch.Tensor] = []
-    for fr in resized_frames:
-        img = read_image_rgb(fr.image_path, resize_hw=(target_h, target_w))
+    for fr, fr_orig in zip(resized_frames, frames):
+        img = read_image_rgb_crop_resize(fr_orig.image_path, target_h, target_w, src_w=fr_orig.w, src_h=fr_orig.h)
         images.append(torch.from_numpy(img).float())
     return resized_frames, images
 
