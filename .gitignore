@@ -216,3 +216,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# project runtime outputs
+output/*
+!output/.gitkeep
+
+# video input
+input/*
+!input/.gitkeep
+
+# local virtual environment
+.venv/

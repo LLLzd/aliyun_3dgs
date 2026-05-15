@@ -1,0 +1,16 @@
+numpy==1.26.4
+scipy==1.12.0
+opencv-python==4.10.0.84
+Pillow==10.4.0
+tqdm==4.66.5
+matplotlib==3.8.4
+imageio==2.35.1
+PyYAML==6.0.2
+scikit-image==0.24.0
+rich==13.7.1
+einops==0.8.0
+
+# 注意：Torch CUDA 版本在 setup.sh 中固定安装为 cu118 轮子。
+# 这里保留版本声明用于依赖锁定与检查。
+torch==2.1.2
+torchvision==0.16.2
