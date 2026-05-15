@@ -19,6 +19,8 @@ import random
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import csv
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -295,14 +297,111 @@ def densify_and_clone(
         return True
 
 
+def resolve_train_point_chunk(args: argparse.Namespace, device: torch.device, logger) -> int:
+    """
+    训练前向使用的点数分块大小。
+    大块/不分块可提高 GPU 利用率并减少 Python 循环次数；显存紧张时请增大分块或关闭自动策略。
+    """
+    if getattr(args, "train_full_point_chunk", False):
+        logger.info("已指定 --train_full_point_chunk：训练前向不分块累加点（最吃显存、通常 GPU 更饱和）。")
+        return 0
+    if getattr(args, "no_auto_train_point_chunk", False):
+        return int(args.render_point_chunk)
+    if device.type != "cuda":
+        return int(args.render_point_chunk)
+    total = torch.cuda.get_device_properties(device).total_memory
+    if int(args.render_point_chunk) > 0 and total >= 17 * (1024**3):
+        logger.info(
+            "检测到显存 ≥17GB 且未加 --no_auto_train_point_chunk：训练前向改为整幅点一次累加（等价 chunk=0），"
+            "以提高 GPU 利用率与吞吐。若 OOM 可显式设置 --render_point_chunk 8192 等并加 --no_auto_train_point_chunk。"
+        )
+        return 0
+    return int(args.render_point_chunk)
+
+
+def append_train_metrics_csv(
+    csv_path: Path,
+    row: Dict[str, float | int],
+    write_header: bool,
+) -> None:
+    fieldnames = [
+        "iter",
+        "loss",
+        "l1",
+        "dssim",
+        "lpips",
+        "gaussians",
+        "lr_xyz",
+        "lr_sh",
+        "lr_opacity",
+        "lr_scale",
+    ]
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            w.writeheader()
+        w.writerow({k: row.get(k, "") for k in fieldnames})
+
+
+def save_train_curves_png(
+    out_path: Path,
+    hist: Dict[str, List[float]],
+    logger,
+) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        logger.warning("未安装 matplotlib，跳过 train_curves.png（指标仍写入 CSV）。")
+        return
+    it = hist.get("iter") or []
+    if len(it) < 2:
+        return
+    fig, axs = plt.subplots(2, 2, figsize=(10, 7), constrained_layout=True)
+    axs[0, 0].plot(it, hist["loss"], color="#1f77b4", lw=1.0)
+    axs[0, 0].set_title("loss")
+    axs[0, 0].set_xlabel("iter")
+    axs[0, 0].grid(True, alpha=0.3)
+
+    axs[0, 1].plot(it, hist["l1"], label="l1", color="#ff7f0e", lw=1.0)
+    axs[0, 1].plot(it, hist["dssim"], label="dssim", color="#2ca02c", lw=1.0)
+    axs[0, 1].set_title("l1 / d-ssim")
+    axs[0, 1].legend(fontsize=8)
+    axs[0, 1].set_xlabel("iter")
+    axs[0, 1].grid(True, alpha=0.3)
+
+    axs[1, 0].plot(it, hist["gaussians"], color="#9467bd", lw=1.0)
+    axs[1, 0].set_title("gaussians")
+    axs[1, 0].set_xlabel("iter")
+    axs[1, 0].grid(True, alpha=0.3)
+
+    axs[1, 1].plot(it, hist["lr_xyz"], label="lr_xyz", color="#d62728", lw=1.0)
+    axs[1, 1].plot(it, hist["lr_sh"], label="lr_sh", color="#8c564b", lw=1.0)
+    axs[1, 1].set_title("learning rate")
+    axs[1, 1].legend(fontsize=8)
+    axs[1, 1].set_xlabel("iter")
+    axs[1, 1].set_yscale("log")
+    axs[1, 1].grid(True, alpha=0.3)
+
+    fig.suptitle("training metrics (live)", fontsize=11)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+
+
 def forward_rgb_image(
     model: GaussianModel,
     cam: Dict[str, torch.Tensor],
     train_h: int,
     train_w: int,
     args: argparse.Namespace,
+    train_point_chunk: int | None = None,
 ) -> torch.Tensor:
     """单视角前向，返回 (H,W,3)。"""
+    pc = int(train_point_chunk) if train_point_chunk is not None else int(args.render_point_chunk)
     if args.rasterizer == "gsplat":
         if not raster_gsplat.is_gsplat_available():
             raise RuntimeError("已选择 --rasterizer gsplat 但未安装 gsplat，请 pip install gsplat 或改用 pytorch。")
@@ -324,7 +423,7 @@ def forward_rgb_image(
         train_h,
         train_w,
         sh_coeffs=model.sh_coeffs,
-        point_chunk=args.render_point_chunk,
+        point_chunk=pc,
     )
 
 
@@ -339,6 +438,8 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
 
     if args.rasterizer == "gsplat" and not raster_gsplat.is_gsplat_available():
         raise RuntimeError("已选择 --rasterizer gsplat 但未安装 gsplat。请 pip install gsplat 后重试，或改用 --rasterizer pytorch。")
@@ -366,11 +467,13 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
             args.rasterizer = str(resume_pack["rasterizer"])
         logger.info("断点续训: 从 %s 恢复，已完成 iter=%d，目标 iters=%d", rp, start_iter, args.iters)
 
+    train_pc = resolve_train_point_chunk(args, device, logger)
+
     logger.info("训练设备: %s", device)
     logger.info(gpu_status_text(device) + gpu_peak_status_text(device))
     logger.info(
         "训练: iters=%d, start=%d, checkpoint_every=%d, views_per_step=%d, rasterizer=%s, max_gaussians=%d, min_gaussians=%d, "
-        "point_chunk=%d, SSIM权重=%.3f",
+        "train_point_chunk=%d (配置 render_point_chunk=%d), lr_hold_frac=%.3f, SSIM权重=%.3f",
         args.iters,
         start_iter,
         getattr(args, "checkpoint_every", 0),
@@ -378,7 +481,9 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
         args.rasterizer,
         args.max_gaussians,
         args.min_gaussians,
-        args.render_point_chunk,
+        train_pc,
+        int(args.render_point_chunk),
+        float(getattr(args, "lr_hold_frac", 0.0)),
         args.ssim_weight,
     )
 
@@ -435,6 +540,23 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
     image_tensors = [img.to(device=device, dtype=torch.float32) for img in images]
     frame_cams = [camera_to_torch(fr, device=device) for fr in frames]
 
+    metrics_csv = logs_dir / "train_metrics.csv"
+    metrics_hist: Dict[str, List[float]] = {
+        "iter": [],
+        "loss": [],
+        "l1": [],
+        "dssim": [],
+        "lpips": [],
+        "gaussians": [],
+        "lr_xyz": [],
+        "lr_sh": [],
+    }
+    csv_need_header = (not metrics_csv.exists()) or metrics_csv.stat().st_size == 0
+    _pe = int(getattr(args, "plot_curves_every", 0) or 0)
+    plot_every = int(args.log_interval) if _pe <= 0 else _pe
+    if getattr(args, "no_train_curves_plot", False):
+        plot_every = 0
+
     n_pts = model.xyz.shape[0]
     xyz_grad_accum = torch.zeros(n_pts, device=device)
     grad_denom = 0.0
@@ -462,7 +584,7 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
             idx = random.randint(0, num_views - 1)
             cam = frame_cams[idx]
             gt = image_tensors[idx]
-            pred = forward_rgb_image(model, cam, args.train_h, args.train_w, args)
+            pred = forward_rgb_image(model, cam, args.train_h, args.train_w, args, train_point_chunk=train_pc)
 
             l1 = torch.mean(torch.abs(pred - gt))
             pred_b = pred.permute(2, 0, 1).unsqueeze(0)
@@ -501,9 +623,18 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
 
         optimizer.step()
 
-        # 余弦学习率（按全局 iter，不依赖 scheduler 对象，便于剪枝后重建优化器）
-        t = (it - 1) / max(args.iters - 1, 1)
-        cosf = 0.5 * (1.0 + math.cos(math.pi * t))
+        # 余弦学习率：可选 lr_hold_frac 比例的前段保持峰值，缓解后段过早衰减导致 loss 平台
+        hold_end = int(max(0.0, min(1.0, float(getattr(args, "lr_hold_frac", 0.0)))) * args.iters)
+        hold_end = min(hold_end, max(args.iters - 2, 0))
+        if hold_end <= 0:
+            t_lr = (it - 1) / max(args.iters - 1, 1)
+            cosf = 0.5 * (1.0 + math.cos(math.pi * t_lr))
+        elif it <= hold_end:
+            cosf = 1.0
+        else:
+            span = max(args.iters - hold_end - 1, 1)
+            t_lr = (it - hold_end - 1) / span
+            cosf = 0.5 * (1.0 + math.cos(math.pi * t_lr))
         with torch.no_grad():
             optimizer.param_groups[0]["lr"] = args.lr_min + (base_lrs["xyz"] - args.lr_min) * cosf
             optimizer.param_groups[1]["lr"] = args.lr_min + (base_lrs["sh"] - args.lr_min) * cosf
@@ -516,13 +647,43 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
             model.log_scales.data.clamp_(-5.5, -0.75)
 
         if it % args.log_interval == 0 or it == start_iter + 1:
+            lr0 = float(optimizer.param_groups[0]["lr"])
+            lr1 = float(optimizer.param_groups[1]["lr"])
+            near_cap = model.xyz.shape[0] >= int(0.93 * args.max_gaussians)
+            cap_hint = " (接近 max_gaussians，增密空间小)" if near_cap else ""
             msg = (
                 f"iter={it}/{args.iters} loss={loss_m:.6f} l1={l1_m:.6f} dssim={dss_m:.6f}"
                 + (f" lpips={lp_m:.6f}" if lpips_fn is not None else "")
-                + f" gaussians={model.xyz.shape[0]} {gpu_status_text(device)}{gpu_peak_status_text(device)}"
+                + f" gaussians={model.xyz.shape[0]}{cap_hint} lr_xyz={lr0:.2e} {gpu_status_text(device)}{gpu_peak_status_text(device)}"
             )
             logger.info(msg)
             pbar.set_postfix(loss=f"{loss_m:.5f}", points=model.xyz.shape[0])
+
+            row = {
+                "iter": it,
+                "loss": loss_m,
+                "l1": l1_m,
+                "dssim": dss_m,
+                "lpips": lp_m if lpips_fn is not None else 0.0,
+                "gaussians": model.xyz.shape[0],
+                "lr_xyz": lr0,
+                "lr_sh": float(optimizer.param_groups[1]["lr"]),
+                "lr_opacity": float(optimizer.param_groups[2]["lr"]),
+                "lr_scale": float(optimizer.param_groups[3]["lr"]),
+            }
+            append_train_metrics_csv(metrics_csv, row, write_header=csv_need_header)
+            csv_need_header = False
+
+            for k in metrics_hist:
+                metrics_hist[k].append(float(row[k]))
+            cap_hist = 10000
+            if len(metrics_hist["iter"]) > cap_hist:
+                over = len(metrics_hist["iter"]) - cap_hist
+                for k in metrics_hist:
+                    metrics_hist[k] = metrics_hist[k][over:]
+
+            if plot_every > 0 and (it % plot_every == 0 or it == start_iter + 1):
+                save_train_curves_png(logs_dir / "train_curves.png", metrics_hist, logger)
 
         # 增密（在剪枝前执行，便于点数增长）
         if (
@@ -583,6 +744,10 @@ def run_training(args: argparse.Namespace) -> Dict[str, str]:
                     logger.info("中间对比渲染目录: %s", out_r)
                 except Exception as ex:  # noqa: BLE001
                     logger.warning("中间渲染失败（训练继续）: %s", ex)
+
+    if plot_every > 0 and len(metrics_hist.get("iter", [])) > 1:
+        save_train_curves_png(logs_dir / "train_curves.png", metrics_hist, logger)
+        logger.info("指标 CSV: %s ；曲线图: %s", metrics_csv, logs_dir / "train_curves.png")
 
     ckpt_path = model_dir / "gaussians_final.pt"
     torch.save(build_training_checkpoint(model, args, args.iters, optimizer), ckpt_path)
@@ -665,7 +830,7 @@ def pipeline(args: argparse.Namespace) -> Dict[str, str]:
         colmap_res = run_colmap_pipeline(
             image_dir=str(frames_dir),
             workspace_dir=str(colmap_dir),
-            use_gpu=1 if args.device == "cuda" else 0,
+            use_gpu=1 if (args.device == "cuda" and torch.cuda.is_available()) else 0,
             matcher=args.colmap_matcher,
             logger_name="colmap",
             log_file=str(logs_dir / "colmap.log"),
@@ -785,6 +950,33 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="中间 checkpoint 保存后不生成对比渲染（节省时间与显存）",
     )
+    parser.add_argument(
+        "--lr_hold_frac",
+        type=float,
+        default=0.22,
+        help="余弦退火前该比例迭代保持峰值 LR，减轻后段过早衰减导致 loss 平台；0=全程标准余弦",
+    )
+    parser.add_argument(
+        "--train_full_point_chunk",
+        action="store_true",
+        help="训练前向点数不分块（最吃显存、通常显著提高 GPU 利用率）",
+    )
+    parser.add_argument(
+        "--no_auto_train_point_chunk",
+        action="store_true",
+        help="关闭「显存≥17GB 时训练自动不分块」策略",
+    )
+    parser.add_argument(
+        "--plot_curves_every",
+        type=int,
+        default=0,
+        help="刷新 logs/train_curves.png 的间隔；0 表示与 --log_interval 相同",
+    )
+    parser.add_argument(
+        "--no_train_curves_plot",
+        action="store_true",
+        help="不写 train_curves.png（仍按 log_interval 追加 train_metrics.csv）",
+    )
     return parser.parse_args()
 
 
@@ -812,13 +1004,14 @@ def apply_mode_preset(args: argparse.Namespace) -> argparse.Namespace:
         args.render_point_chunk = min(args.render_point_chunk, 12000) if args.render_point_chunk else 12000
         args.densify_interval = 0
         args.rasterizer = "pytorch"
+        args.lr_hold_frac = 0.0
     elif args.mode == "full":
         args.iters = max(args.iters, 60000)
         args.train_h = max(args.train_h, 512)
         args.train_w = max(args.train_w, 512)
         args.render_h = max(args.render_h, 512)
         args.render_w = max(args.render_w, 512)
-        args.max_gaussians = max(args.max_gaussians, 300000)
+        args.max_gaussians = max(args.max_gaussians, 450000)
         args.min_gaussians = max(args.min_gaussians, 8000)
         args.target_frames = max(args.target_frames, 128)
         args.min_frames = max(args.min_frames, 110)
@@ -826,6 +1019,7 @@ def apply_mode_preset(args: argparse.Namespace) -> argparse.Namespace:
         args.opacity_prune_threshold = min(args.opacity_prune_threshold, 0.014)
         args.prune_start = max(args.prune_start, 2200)
         args.views_per_step = max(args.views_per_step, 4)
+        args.densify_grad_thresh = min(args.densify_grad_thresh, 1.65e-4)
         if args.render_point_chunk <= 0:
             args.render_point_chunk = 65536
 

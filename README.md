@@ -1,299 +1,232 @@
-# aliyun_3dgs（A10-30G 一键 3D Gaussian Splatting）
+# aliyun_3dgs
 
-本工程面向**阿里云 A10-30G GPU + 4CPU**环境，提供从 iPhone 视频到 3D 重建结果的端到端自动流程：
-
-- 输入：`input/object.MOV`（约 20 秒环绕小物体视频）；
-- 自动流程：抽帧 -> COLMAP 位姿估计 -> 轻量 3DGS 训练 -> 模型导出 -> 多角度渲染对比；
-- 输出：`output/<run_name>/` 下的模型文件（`.pt/.ply/.splat`）、至少 8 张对比图、训练日志与运行摘要。
-
-> 说明：默认训练为 **PyTorch 可微 splat + 球谐颜色 + 多视角 + SSIM**；可选 **`--rasterizer gsplat`** 使用 CUDA 光栅化（需单独安装 `gsplat`）。增密/剪枝与显存分块用于在 A10-30G 上拉高上限。
+面向 **NVIDIA A10 30GB / 4 vCPU** 等云端环境的 **3D Gaussian Splatting** 端到端流水线：从环绕物体视频到可导出模型与多视角对比渲染。默认使用 **PyTorch 可微光栅 + 球谐颜色（deg≤2）+ L1 / D-SSIM**，可选 **gsplat** 高质量 CUDA 光栅。
 
 ---
 
-## 1. 项目结构（可直接运行）
+## 功能概览
+
+| 模块 | 说明 |
+|------|------|
+| 抽帧 | 去模糊、感知哈希去重，输出约 100–150 张关键帧 |
+| COLMAP | 自动 SfM，导出 `transforms.json` 与 `points3d.npz` |
+| 训练 | 多视角随机采样、余弦 LR、可选 LPIPS、增密 / 剪枝（`pytorch` 后端） |
+| 导出 | `.ply`（ASCII 点云）、`.splat`（二进制） |
+| 渲染 | 至少 8 张「原图 vs 重建」对比图 |
+| 断点 | 周期性 `.pt`、优化器状态、`--resume` 续训；中间存档可触发对比渲染 |
+| 监控 | `train_metrics.csv` + 周期性更新的 `train_curves.png` |
+
+---
+
+## 环境要求
+
+### 推荐（生产）
+
+- **系统**：Ubuntu 20.04 / 22.04  
+- **GPU**：NVIDIA A10 30GB（或其它 ≥16GB 显存的 CUDA GPU）  
+- **驱动 / CUDA**：与 PyTorch cu118 轮子匹配（见 `setup.sh` / 官方说明）  
+- **Python**：3.10  
+- **系统工具**：FFmpeg、COLMAP（`setup.sh` 可安装）
+
+### 本地试跑（macOS / 无 NVIDIA）
+
+- **不要直接执行** `setup.sh`（脚本面向 Ubuntu + `nvidia-smi`）。  
+- 自行安装：`brew install colmap ffmpeg`，按 [PyTorch 官网](https://pytorch.org) 安装 **macOS arm64** 的 torch。  
+- 运行示例：`python train.py --mode quick --device cpu --video_path …`  
+- 使用 **`--rasterizer pytorch`**；勿在 Mac 上依赖 **gsplat**（CUDA 向）。
+
+---
+
+## 仓库结构
 
 ```text
 aliyun_3dgs/
-├── input/                      # 输入视频目录（放 object.MOV）
-│   └── .gitkeep
-├── output/                     # 输出目录（自动生成每次运行子目录）
-│   └── .gitkeep
-├── utils.py                    # 公共工具：日志、命令执行、可微渲染、显存统计等
-├── sh_utils.py                 # 球谐 SH deg≤2 与相机中心工具
-├── loss_utils.py               # SSIM / D-SSIM 损失
-├── raster_gsplat.py            # 可选 gsplat 光栅封装
-├── video2img.py                # 视频抽帧：去模糊、去重复，输出 100~150 张
-├── colmap_process.py           # COLMAP 自动 SfM，导出 transforms.json + points3d.npz
-├── train.py                    # 主脚本：端到端一键流程（quick/full）
-├── render.py                   # 多角度原始帧 vs 重建渲染对比图
-├── export_model.py             # 导出 .ply / .splat
-├── setup.sh                    # 一键环境部署（含 GPU/CUDA 校验、COLMAP/FFmpeg 安装）
-├── run_all.sh                  # 一键运行入口（full 或 quick）
-├── requirements.txt            # Python 依赖版本锁定（Py3.10）
-├── .gitignore
-└── README.md
+├── train.py              # 主入口：pipeline（抽帧→COLMAP→训练→导出→渲染）
+├── video2img.py          # 抽帧
+├── colmap_process.py     # COLMAP 封装
+├── utils.py              # 渲染、相机、日志、显存等
+├── sh_utils.py           # SH deg≤2、视线相关颜色
+├── loss_utils.py         # D-SSIM 等
+├── raster_gsplat.py      # 可选 gsplat 光栅
+├── render.py             # 独立对比渲染
+├── export_model.py       # 独立导出 ply/splat
+├── setup.sh              # Ubuntu + CUDA 环境一键准备
+├── run_all.sh            # 调用 train.py（quick / full）
+├── requirements.txt
+├── input/                # 放置输入视频（如 object.MOV）
+└── output/               # 每次运行生成子目录
 ```
 
 ---
 
-## 2. 环境要求（阿里云 A10）
-
-- 系统：Ubuntu 20.04 或 22.04（推荐）
-- GPU：NVIDIA A10 30GB
-- CUDA：11.8+（由驱动支持）
-- Python：3.10
-- CPU：4 核可运行（默认参数已控制负载）
-
----
-
-## 3. 一键部署
-
-在项目根目录执行：
+## 快速开始
 
 ```bash
+cd /path/to/aliyun_3dgs
+
+# Ubuntu / A10：先准备环境
 bash setup.sh
-```
 
-`setup.sh` 会自动执行：
-
-1. 系统检测（OS、GPU、CUDA）；
-2. 安装系统依赖（`ffmpeg`、`colmap`、`python3.10-venv` 等）；
-3. 直接使用系统 Python 环境（不创建 `.venv`）；
-4. 安装 `requirements.txt` 中除 `torch/torchvision` 外的依赖；
-5. 保留镜像预装 PyTorch，仅做 Torch CUDA 可用性校验；
-6. 运行环境校验（`ffmpeg` 和 `colmap` 命令检测）。
-
----
-
-## 4. 输入数据准备
-
-把视频放到：
-
-```text
-input/object.MOV
-```
-
-要求建议：
-
-- 物体基本保持在画面中心；
-- 绕物体平稳环绕 1 圈左右；
-- 光照尽量稳定，避免严重动态模糊；
-- 时长 15~30 秒均可（默认按 20 秒左右优化）。
-
----
-
-## 5. 一键运行（端到端）
-
-### 5.1 完整重建（推荐，20~40 分钟）
-
-```bash
+# 完整重建（默认 full 预设会抬高迭代、分辨率与点数上限）
 python train.py --mode full --video_path input/object.MOV --output_root output
-```
 
-或：
-
-```bash
-bash run_all.sh full
-```
-
-### 5.2 快速验证（约 2 分钟）
-
-```bash
+# 流程冒烟（约数分钟级，视机器而定）
 python train.py --mode quick --video_path input/object.MOV --output_root output
 ```
 
-或：
+或使用：
 
 ```bash
+bash run_all.sh full
 bash run_all.sh quick
 ```
 
 ---
 
-## 6. 输出说明
+## 运行模式：`quick` 与 `full`
 
-单次运行输出目录示例：
+| 项目 | `quick` | `full`（默认 `--mode full`） |
+|------|---------|--------------------------------|
+| 用途 | 验环境、通流程 | 正式重建 |
+| 迭代 | 上限约 420 | ≥ 60000（可被 `--iters` 覆盖） |
+| 分辨率 | 压至 256² | ≥ 512² |
+| 高斯上限 | 约 2.2 万 | 预设下限 **45 万**（可被 `--max_gaussians` 再调高） |
+| 增密 | 关闭 | 开启（仅 `pytorch` 光栅） |
+
+正方形训练分辨率下，对输入图做**中心正方形裁剪**（边长 `min(宽,高)`）再缩放，**不拉伸**。
+
+---
+
+## 输出目录约定
 
 ```text
-output/full_20260515_180000/
+output/<run_name>/
 ├── logs/
 │   ├── pipeline.log
 │   ├── train.log
 │   ├── colmap.log
 │   ├── render.log
-│   └── frame_stats.json
+│   ├── frame_stats.json
+│   ├── train_metrics.csv      # 按 log_interval 追加的训练指标
+│   └── train_curves.png       # 与 CSV 同步刷新的曲线图（可关闭，见下文）
 ├── models/
 │   ├── gaussians_final.pt
+│   ├── gaussians_iter_*.pt    # 周期性 checkpoint（若开启）
+│   ├── gaussians_latest.pt    # 最近一次中间存档
 │   ├── gaussians_final.ply
 │   └── gaussians_final.splat
 ├── renders/
-│   ├── compare_01.png
-│   ├── compare_02.png
-│   ├── ...（至少8张）
+│   ├── compare_*.png
+│   ├── iter_*/                  # 中间 checkpoint 触发的对比图（若未 --no_render_on_checkpoint）
 │   └── render_meta.json
 ├── tmp/
-│   ├── frames/                 # 抽帧结果
-│   └── colmap/                 # COLMAP 中间文件
+│   ├── frames/
+│   └── colmap/
 └── run_summary.json
 ```
 
 ---
 
-## 7. 核心脚本用法
+## 训练与性能相关参数
 
-### 7.1 `video2img.py`
+### 设备与光栅
 
-```bash
-python video2img.py \
-  --input_video input/object.MOV \
-  --output_dir output/tmp/frames \
-  --target_frames 120 \
-  --min_frames 100 \
-  --max_frames 150
-```
+- `--device cuda|cpu`：无 CUDA 时训练会自动落到 CPU；**COLMAP 的 GPU 开关**仅在 `torch.cuda.is_available()` 时开启，避免 Mac 上误开 CUDA SIFT。  
+- `--rasterizer pytorch|gsplat`：**gsplat** 需单独 `pip install gsplat` 且需 CUDA；增密 / 剪枝当前仅在 **pytorch** 路径启用。
 
-常用参数：
+### 显存与吞吐（A10 常见调优）
 
-- `--target_frames`：目标抽帧数量（自动换算 fps）；
-- `--blur_threshold`：去模糊阈值（越大越严格）；
-- `--hash_distance_threshold`：去重复阈值（越小越容易删重复）。
+- **`render_point_chunk`**：>0 时按点数分块光栅，降低峰值显存；**0** 表示整幅一次累加。  
+- **自动策略**：在 CUDA 且显存 **≥ 17GB** 时，若未加 `--no_auto_train_point_chunk`，训练前向会**自动改为不分块**（等价 chunk=0），以提高 GPU 利用率；OOM 时请加 `--no_auto_train_point_chunk` 并适当设 `--render_point_chunk`（如 32768）。  
+- **`--train_full_point_chunk`**：强制训练不分块（最吃显存）。  
+- **`--views_per_step`**：每优化步内随机采样的视角数；在单 backward 内会保留多视角计算图，**会抬高显存与单步耗时**，用于降低梯度方差。
 
-### 7.2 `colmap_process.py`
+### 学习率与损失
 
-```bash
-python colmap_process.py \
-  --image_dir output/tmp/frames \
-  --workspace_dir output/tmp/colmap \
-  --matcher sequential
-```
+- **`--lr_hold_frac`**（默认 **0.22**）：前若干比例迭代保持**峰值学习率**，再在剩余区间做余弦衰减，减轻后段过早衰减导致的 loss 平台；`quick` 模式会置 **0**（全程标准余弦）。  
+- **`--lr_min`**：余弦下端。  
+- **`--ssim_weight`**：D-SSIM 与 L1 的混合权重。  
+- **`--use_lpips` / `--lpips_weight`**：可选感知损失（需安装 `lpips`）。
 
-常用参数：
+### 点数与增密
 
-- `--matcher sequential|exhaustive`：视频序列推荐 `sequential`（更快更稳）；
-- `--use_gpu 1`：启用 COLMAP GPU 特征提取/匹配。
+- **`--max_gaussians` / `--min_gaussians`**：上限与剪枝保留下限；接近上限时增密空间变小，日志会提示。  
+- **`--densify_*` / `--prune_*`**：增密与剪枝节奏（仅 pytorch 后端）。
 
-### 7.3 `train.py`
+### 周期性存档与续训
 
-```bash
-python train.py --mode full --video_path input/object.MOV --output_root output
-```
+- **`--checkpoint_every N`**（默认 **10000**）：每 N iter 写入 `gaussians_iter_*.pt` 与 `gaussians_latest.pt`；**0** 关闭。checkpoint 内含 **`global_step`**、模型、`optimizer`、以及 **`transforms_path` / `points3d_path`** 等元数据。  
+- **`--resume path/to.pt`**：跳过抽帧与 COLMAP，在同一 `run_dir` 下继续训练；**`--iters` 须大于 checkpoint 中的 `global_step`**。  
+- **`--no_render_on_checkpoint`**：中间存档**不**跑对比渲染（省时间 / 显存）。
 
-关键参数：
+### 训练过程可视化
 
-- `--mode quick|full`：快速验证 / 完整训练（full 默认更长迭代、更多高斯、多视角与 SSIM）；
-- `--rasterizer pytorch|gsplat`：`pytorch` 为默认可微 splat；`gsplat` 为高质量光栅（需 `pip install gsplat`）；
-- `--iters`：外层迭代步数；`--views_per_step`：每步随机视角数（增大吃显存）；
-- `--render_point_chunk`：渲染时每批高斯点数（分块降峰值显存，0 为不分块）；
-- `--ssim_weight` / `--use_lpips` / `--lpips_weight`：感知损失组合；
-- `--densify_interval` / `--densify_from` / `--densify_grad_thresh` / `--densify_size_thresh`：增密（仅 `pytorch` 后端）；
-- `--max_gaussians` / `--min_gaussians`：点数上下限与剪枝；
-- `--train_h --train_w`：训练输出边长（默认 **512×512**）；当二者相等时，对原图做**以画面中心为基准的正方形裁剪**（边长 `min(宽,高)`），再缩放到该边长，不拉伸；
-- `--render_h --render_w`：对比图边长（默认 512）；
-- `--render_views`：对比图视角数量（至少 8）。
-
-### 7.4 `render.py`
-
-```bash
-python render.py \
-  --checkpoint output/full_xxx/models/gaussians_final.pt \
-  --transforms output/full_xxx/tmp/colmap/transforms.json \
-  --output_dir output/full_xxx/renders \
-  --min_views 8
-```
-
-### 7.5 `export_model.py`
-
-```bash
-python export_model.py \
-  --checkpoint output/full_xxx/models/gaussians_final.pt \
-  --output_dir output/full_xxx/models \
-  --stem_name gaussians_final
-```
-
-会导出：
-
-- `gaussians_final.ply`：点云（带 RGBA）；
-- `gaussians_final.splat`：轻量二进制 splat 数据（`SPLAT1` 头）。
+- **`logs/train_metrics.csv`**：在 **`--log_interval`**（默认 50）与第一步迭代时追加一行指标。  
+- **`logs/train_curves.png`**：默认按与 `log_interval` 相同节奏刷新（可用 **`--plot_curves_every`** 单独指定；**0** 表示与 `log_interval` 一致）。  
+- **`--no_train_curves_plot`**：仅关闭 PNG，**仍写 CSV**。
 
 ---
 
-## 8. 渲染对比图解读
+## 子脚本（进阶）
 
-每张 `compare_xx.png` 左右对比：
+### `video2img.py`
 
-- 左：原始视频帧（COLMAP 对应视角）；
-- 右：重建渲染图；
-- 底部标注角度（正面、侧面、背面、45°斜视角、顶面、底面等）。
+抽帧与质量过滤；参数含 `--target_frames`、`--blur_threshold`、`--hash_distance_threshold` 等。
 
-用途：
+### `colmap_process.py`
 
-- 快速判断几何轮廓是否重建正确；
-- 检查颜色一致性与表面细节；
-- 判断是否需要补拍或延长训练。
+`--matcher sequential|exhaustive`；`--use_gpu 0|1` 控制 COLMAP 内部 SIFT GPU（与 `train.py` 的 pipeline 逻辑独立时可手调）。
 
----
+### `render.py` / `export_model.py`
 
-## 9. A10 环境专属建议
-
-1. **优先使用 full 模式默认参数**：在 A10-30G 上通常可稳定运行，避免直接拉满分辨率；
-2. **显存监控**：`train.log` 会周期输出显存与高斯点数；
-3. **OOM 处理**：调小 `--max_gaussians`（如 50000）和正方形边长，例如 `--train_h 448 --train_w 448`；
-4. **速度优化**：`--matcher sequential` + 合理抽帧（100~150）通常更快；
-5. **画质优化**：增加 `--iters`（如 9000~12000）并保证视频清晰。
+对已存在的 `gaussians_final.pt`（或中间 `.pt`）单独渲染或导出；需传入对应 `transforms.json` 路径。
 
 ---
 
-## 10. 常见问题排查（FAQ）
+## 对比图说明
 
-### Q1: `colmap: command not found`
-
-- 先执行 `bash setup.sh`；
-- 确认 `which colmap` 有输出。
-
-### Q2: Torch 显示 CUDA 不可用
-
-- 检查 `nvidia-smi` 是否正常；
-- 重装 CUDA 对应轮子：
-  ```bash
-  pip install --upgrade --force-reinstall torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/cu118
-  ```
-
-### Q3: 报显存不足（OOM）
-
-- 降低参数：
-  - `--max_gaussians 45000`
-  - `--train_h 448 --train_w 448`（须保持正方形；若只写一边，程序会取较小边统一为正方形）
-- 或先用 `--mode quick` 验证流程。
-
-### Q4: 重建模糊 / 漂浮点多
-
-- 拍摄时降低模糊、保证环绕连续；
-- 提高抽帧质量（适当提高 `--blur_threshold`）；
-- 适当增加 `--iters`，并保证光照稳定。
+`compare_*.png`：**左**为 COLMAP 对应视角原图，**右**为模型渲染；底部为中文视角标签。用于快速检查几何、颜色与是否需要补拍或加长训练。
 
 ---
 
-## 11. 算法说明（简要）
+## 常见问题（FAQ）
 
-本工程在工程可落地优先前提下，采用了 Compact 化思路：
+### `colmap: command not found`
 
-- 使用 COLMAP 稀疏点初始化高斯，减少冷启动不稳定；
-- 训练过程中按透明度与点数上限执行剪枝，避免显存爆炸；
-- 使用可微双线性 splat 渲染器，纯 PyTorch 实现，无需额外编译；
-- 持续输出显存占用与高斯点数量，便于 A10 环境稳定运行。
+执行 `bash setup.sh`（Ubuntu），或在本机用包管理器安装 COLMAP。
+
+### PyTorch 提示 CUDA 不可用
+
+检查 `nvidia-smi` 与驱动；按 PyTorch 官网安装与驱动匹配的 `torch` / `torchvision` cu118 轮子。
+
+### 训练 OOM
+
+减小 `--max_gaussians`、降低正方形边长（如 `--train_h 448 --train_w 448`）、减小 `--views_per_step`，或加 **`--no_auto_train_point_chunk`** 并设置较大的 **`--render_point_chunk`**。
+
+### loss 长期不降、高斯数不涨
+
+常见原因：（1）**点数已接近 `max_gaussians`**，增密无空间；（2）**轻量 bilinear 光栅 + 分辨率** 的表达上限；（3）学习率已进入余弦尾段。可尝试：提高 **`--max_gaussians`**、调整 **`--lr_hold_frac`**、略增 **`--iters`**，或换 **`--rasterizer gsplat`**（在支持 CUDA 的机器上）。
+
+### 旧 checkpoint 无法 `--resume`
+
+仅带 **`global_step`** 与 **`transforms_path` / `points3d_path`** 的新版中间存档支持 pipeline 级续训；仅有 `gaussians_final.pt` 的旧文件请用于渲染 / 导出，勿依赖其作为进度续训。
 
 ---
 
-## 12. 最短路径（复制即跑）
+## 算法与实现要点（简要）
+
+- COLMAP 稀疏点初始化高斯，降低冷启动不稳定。  
+- 球谐 deg≤2 视线相关颜色，多视角颜色更一致。  
+- 透明度与点数上限驱动的剪枝；`pytorch` 路径下简易 clone / split 增密。  
+- 训练日志中周期性输出显存与高斯数，便于在固定规格 GPU 上稳定排障。
+
+---
+
+## 最短命令备忘
 
 ```bash
-cd /path/to/aliyun_3dgs
 bash setup.sh
 python train.py --mode full --video_path input/object.MOV --output_root output
 ```
 
-完成后查看：
-
-- 模型：`output/<run_name>/models/`
-- 对比图：`output/<run_name>/renders/`
-- 日志：`output/<run_name>/logs/`
+完成后查看 **`output/<run_name>/models/`**、**`renders/`**、**`logs/train_curves.png`** 与 **`run_summary.json`**。
